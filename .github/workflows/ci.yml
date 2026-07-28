@@ -1,0 +1,106 @@
+name: ci
+
+# Runs on every push and pull request.
+#
+# GitHub-hosted runners have no NVIDIA GPU. That bounds what CI can prove:
+# the CUDA toolkit compiles kernels without a device, and the tests are written
+# to skip rather than fail when no device is present, so a green run here means
+# "it builds and the CPU-side logic is correct" — not "the kernels are correct".
+# Kernel behaviour is verified on real hardware before tagging a release.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  WHETSTONE_CUDA_ARCH: "75"
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, windows-2022]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install CUDA toolkit
+        uses: Jimver/cuda-toolkit@v0.2.19
+        with:
+          cuda: "12.4.1"
+          method: network
+          sub-packages: '["nvcc", "cudart"]'
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Clippy
+        run: cargo clippy --release --all-targets --locked -- -D warnings
+
+      - name: Test
+        # GPU tests skip themselves on a device-less runner; the CPU-side
+        # tests (format, quantizer, config, safetensors) still run.
+        run: cargo test --release --locked
+
+      - name: CLI smoke test
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN=target/release/whetstone
+          [[ "${{ matrix.os }}" == windows* ]] && BIN=target/release/whetstone.exe
+          "$BIN" --version
+          "$BIN" --help
+          "$BIN" convert --help
+
+  python:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Syntax check the harness
+        run: |
+          python -m compileall -q bench scripts/download_model.py
+          echo "all harness files parse"
+
+      - name: Shell scripts
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          bash -n scripts/deploy.sh scripts/run.sh
+          shellcheck -S warning scripts/deploy.sh scripts/run.sh || true
+
+  docs:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Version and changelog agree
+        run: |
+          set -euo pipefail
+          V=$(sed -n 's/^version *= *"\(.*\)"/\1/p' Cargo.toml | head -1)
+          echo "Cargo.toml version: $V"
+          if ! grep -q "\[$V\]" CHANGELOG.md; then
+            echo "::warning::CHANGELOG.md has no section for [$V] — required before tagging"
+          fi
+
+      - name: Required docs present
+        run: |
+          set -euo pipefail
+          for f in README.md LICENSE CHANGELOG.md docs/FORMAT.md docs/ROADMAP.md \
+                   docs/RELEASES.md .github/release-notes-template.md; do
+            [[ -f "$f" ]] || { echo "::error::missing $f"; exit 1; }
+          done
+          echo "all required docs present"

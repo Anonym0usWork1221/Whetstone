@@ -1,0 +1,46 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/whetstone-kernels",
+    "crates/whetstone-core",
+    "crates/whetstone-quant",
+    "crates/whetstone-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "Apache-2.0"
+repository = "https://github.com/Anonym0usWork1221/Whetstone"
+description = "A low-bit LLM inference engine that trades multiplication for bit arithmetic."
+
+[workspace.dependencies]
+whetstone-kernels = { path = "crates/whetstone-kernels" }
+whetstone-core = { path = "crates/whetstone-core" }
+whetstone-quant = { path = "crates/whetstone-quant" }
+
+anyhow = "1"
+thiserror = "2"
+half = { version = "2", features = ["num-traits"] }
+memmap2 = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rayon = "1"
+clap = { version = "4", features = ["derive"] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
+# Benchmarks want release-grade codegen. `panic` is inherited from the test
+# profile by cargo and cannot be set here, so it is deliberately omitted.
+[profile.bench]
+inherits = "release"
+
+[profile.release-dbg]
+inherits = "release"
+debug = true
+panic = "unwind"

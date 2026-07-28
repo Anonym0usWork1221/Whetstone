@@ -1,0 +1,16 @@
+[package]
+name = "whetstone-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Model loading, configuration, and the roofline model for Whetstone."
+
+[dependencies]
+whetstone-kernels.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+memmap2.workspace = true
+half.workspace = true

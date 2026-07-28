@@ -1,0 +1,19 @@
+[package]
+name = "whetstone-kernels"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "CUDA kernels and safe device bindings for Whetstone."
+
+[dependencies]
+thiserror.workspace = true
+half.workspace = true
+
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+
+[dev-dependencies]
+whetstone-quant.workspace = true

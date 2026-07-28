@@ -1,0 +1,38 @@
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+
+# Model weights and converted formats
+*.safetensors
+*.gguf
+*.bin
+*.pt
+*.pth
+*.wstone
+/models/
+
+# Measurement output
+*.ncu-rep
+*.nsys-rep
+*.qdrep
+/bench/results/
+*.log
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Converted weights
+*.wstone
+dist/

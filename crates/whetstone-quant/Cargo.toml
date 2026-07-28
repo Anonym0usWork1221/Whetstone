@@ -1,0 +1,14 @@
+[package]
+name = "whetstone-quant"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Weight quantization and the .wstone container format for Whetstone."
+
+[dependencies]
+half.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true

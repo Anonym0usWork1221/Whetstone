@@ -1,0 +1,188 @@
+name: release
+
+# Tagging is the release trigger:
+#
+#     git tag -a v0.1.0 -m "..." && git push origin v0.1.0
+#
+# This builds Linux and Windows packages, verifies the tag matches Cargo.toml,
+# and publishes a GitHub release with generated notes.
+#
+# Note on runners: GitHub-hosted runners have no NVIDIA GPU. The CUDA toolkit
+# compiles kernels fine without one, but the GPU tests cannot run here, so CI
+# checks that the code *builds* and that CPU-only tests pass. Kernel behaviour
+# is verified on real hardware before tagging -- see CONTRIBUTING notes in
+# docs/RELEASES.md.
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+-*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build (must already exist)"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  # Turing. Every artifact is named with the arch it was built for, because a
+  # binary built for one architecture will not run on an older card.
+  WHETSTONE_CUDA_ARCH: "75"
+
+jobs:
+  # Fail fast and cheaply if the tag and the manifest disagree.
+  check-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: v
+        name: Tag must match Cargo.toml
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME:-${{ github.event.inputs.tag }}}"
+          TAG_VERSION="${TAG#v}"
+          # Strip any pre-release suffix for the comparison.
+          BASE="${TAG_VERSION%%-*}"
+          MANIFEST=$(sed -n 's/^version *= *"\(.*\)"/\1/p' Cargo.toml | head -1)
+
+          echo "tag=$TAG  tag_version=$BASE  Cargo.toml=$MANIFEST"
+          if [[ "$BASE" != "$MANIFEST" ]]; then
+            echo "::error::tag $TAG implies version $BASE but Cargo.toml says $MANIFEST"
+            exit 1
+          fi
+          echo "version=$TAG_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: CHANGELOG must mention this version
+        run: |
+          set -euo pipefail
+          V="${{ steps.v.outputs.version }}"
+          if [[ -f CHANGELOG.md ]] && ! grep -q "\[$V\]" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no section for [$V]"
+            exit 1
+          fi
+
+  build:
+    needs: check-version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            name: linux-x86_64
+            script: ./scripts/deploy.sh --skip-tests
+            artifact: "*.tar.gz*"
+          - os: windows-2022
+            name: windows-x86_64
+            script: powershell -ExecutionPolicy Bypass -File scripts/deploy.ps1 -SkipTests
+            artifact: "*.zip*"
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.name }}-sm${{ env.WHETSTONE_CUDA_ARCH }}
+
+      - name: Install CUDA toolkit
+        uses: Jimver/cuda-toolkit@v0.2.19
+        with:
+          cuda: "12.4.1"
+          method: network
+          # Only what nvcc needs to compile and archive; the full toolkit is
+          # several GB and most of it is irrelevant here.
+          sub-packages: '["nvcc", "cudart"]'
+
+      - name: Show toolchain
+        shell: bash
+        run: |
+          nvcc --version
+          rustc --version
+          cargo --version
+
+      - name: Build and package
+        shell: bash
+        env:
+          WHETSTONE_GIT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          # Reproducible build stamp from the tagged commit, not from "now".
+          export SOURCE_DATE_EPOCH=$(git log -1 --pretty=%ct)
+          ${{ matrix.script }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: whetstone-${{ matrix.name }}
+          path: dist/${{ matrix.artifact }}
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    needs: [check-version, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Collect checksums
+        run: |
+          set -euo pipefail
+          cd artifacts
+          ls -la
+          # One combined file is friendlier than one per artifact.
+          cat *.sha256 > SHA256SUMS 2>/dev/null || true
+          cat SHA256SUMS || true
+
+      - name: Build release notes
+        run: |
+          set -euo pipefail
+          V="${{ needs.check-version.outputs.version }}"
+
+          # Prefer the hand-written CHANGELOG section: it says what changed and
+          # why, which a generated commit list does not.
+          if [[ -f CHANGELOG.md ]] && grep -q "\[$V\]" CHANGELOG.md; then
+            awk -v v="$V" '
+              $0 ~ "^## \\[" v "\\]" {p=1; next}
+              p && /^## \[/ {exit}
+              p {print}
+            ' CHANGELOG.md > notes.md
+          else
+            echo "_No CHANGELOG entry for $V._" > notes.md
+          fi
+
+          # Static install/usage section lives in its own file rather than a
+          # heredoc: markdown horizontal rules and fenced blocks do not survive
+          # being embedded in a YAML block scalar.
+          cat .github/release-notes-template.md >> notes.md
+
+          echo "--- release notes ---"
+          cat notes.md
+
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "Whetstone ${{ needs.check-version.outputs.version }}"
+          body_path: notes.md
+          files: |
+            artifacts/*.tar.gz
+            artifacts/*.zip
+            artifacts/SHA256SUMS
+          draft: false
+          prerelease: ${{ contains(needs.check-version.outputs.version, '-') }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true

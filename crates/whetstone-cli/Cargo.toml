@@ -1,0 +1,21 @@
+[package]
+name = "whetstone-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Command-line interface for Whetstone."
+
+[[bin]]
+name = "whetstone"
+path = "src/main.rs"
+
+[dependencies]
+whetstone-kernels.workspace = true
+whetstone-core.workspace = true
+whetstone-quant.workspace = true
+half.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+clap.workspace = true
