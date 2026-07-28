@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 mod bench;
+mod chat;
 mod convert;
 mod eval;
 mod inspect;
@@ -134,6 +135,39 @@ enum Command {
         gemv_variant: Option<i32>,
     },
 
+    /// Interactive chat, with throughput reported per turn.
+    ///
+    /// The KV cache is kept across turns, so each turn only prefills its own
+    /// message rather than re-sending the transcript.
+    Chat {
+        /// The .wstone file.
+        model: std::path::PathBuf,
+        /// Directory holding tokenizer.json, if the .wstone has none embedded.
+        #[arg(long)]
+        tokenizer: Option<std::path::PathBuf>,
+        /// System prompt.
+        #[arg(long)]
+        system: Option<String>,
+        /// KV cache capacity in tokens; the conversation lives here.
+        #[arg(long, default_value_t = 4096)]
+        ctx: usize,
+        /// Maximum tokens per reply.
+        #[arg(long, default_value_t = 512)]
+        max_new: usize,
+        /// Sampling temperature. 0 is greedy and never leaves the GPU.
+        #[arg(long, default_value_t = 0.7)]
+        temperature: f32,
+        /// Nucleus mass.
+        #[arg(long, default_value_t = 0.8)]
+        top_p: f32,
+        /// PRNG seed.
+        #[arg(long, default_value_t = 0)]
+        seed: u64,
+        /// Answer this once and exit, instead of reading from the terminal.
+        #[arg(long)]
+        prompt: Option<String>,
+    },
+
     /// Perplexity over a token stream, the headline quality gate.
     ///
     /// Compare against the fp16 baseline taken with the same tokens, the same
@@ -231,6 +265,28 @@ fn main() -> Result<()> {
         Command::Verify { file, source, bandwidth } => {
             verify::run(&file, source.as_deref(), bandwidth).context("verify failed")
         }
+        Command::Chat {
+            model,
+            tokenizer,
+            system,
+            ctx,
+            max_new,
+            temperature,
+            top_p,
+            seed,
+            prompt,
+        } => chat::run(chat::ChatArgs {
+            model: &model,
+            tokenizer: tokenizer.as_deref(),
+            system,
+            ctx,
+            max_new,
+            temperature,
+            top_p,
+            seed,
+            prompt,
+        })
+        .context("chat failed"),
         Command::Tune { model, ids, tokens, samples } => {
             tune::run(&model, &parse_ids(&ids)?, tokens, samples).context("tune failed")
         }

@@ -407,9 +407,18 @@ python bench/chat.py --model /path/to/model --bench --out report.json
 
 ### Running the engine
 
+The binary is a normal cargo artifact — `./target/release/whetstone`, or
+`cargo install --path crates/whetstone-cli` to put `whetstone` on your PATH.
+
 ```bash
-# Convert once, then execute with no Python in the token loop
+# Convert once, then execute with no Python in the token loop.
+# The tokenizer is embedded, so the .wstone needs no sidecar files.
 whetstone convert /path/to/Qwen2.5-0.5B-Instruct -o model.wstone --head int4
+
+# Interactive chat, throughput reported per turn
+whetstone chat model.wstone
+
+# Or a single generation from token ids, for timing without a tokenizer in the loop
 whetstone run model.wstone --ids 785,6722,315,9625,374 --max-new 256 --graph
 
 # Quality gate: perplexity over a fixed token stream, comparable to any
@@ -421,6 +430,29 @@ whetstone ppl model.wstone --tokens wikitext2.u32 --window 2048 --windows 20
 whetstone run model.wstone --ids 785 --profile 64
 whetstone tune model.wstone
 ```
+
+`whetstone chat` keeps the KV cache across turns, so turn twenty prefills only
+its own message rather than the whole transcript, and each reply reports its own
+tokens/second:
+
+```text
+> What is the capital of Japan?
+The capital of Japan is Tokyo.
+  [419.4 tok/s · 7 tokens in 0.02 s · prefill 26 in 62 ms · 110 GB/s · ctx 33]
+
+> What is its population, roughly?
+As of 2021, the estimated population of Tokyo is around 11 million.
+  [448.4 tok/s · 20 tokens in 0.04 s · prefill 17 in 41 ms · 118 GB/s · ctx 70]
+```
+
+Note the second turn prefills 17 tokens, not 43 — the first turn is still in the
+cache.
+
+`--temperature 0` is the fastest path at **467 tok/s**: greedy decode never
+leaves the GPU, because the argmax writes into the device cursor that the next
+step's embedding gather reads. Sampling runs at **369 tok/s** — it needs the
+distribution on the host, which is a 608 KB copy plus an O(vocab) selection per
+token.
 
 `--body fp16` produces a lossless reference model. Keeping one runnable at all
 times is what separates "the engine is wrong" from "the quantizer is lossy" —

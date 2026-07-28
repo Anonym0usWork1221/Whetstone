@@ -15,3 +15,7 @@ serde_json.workspace = true
 memmap2.workspace = true
 whetstone-quant.workspace = true
 half.workspace = true
+unicode-normalization = "0.1"
+
+[dev-dependencies]
+unicode-normalization = "0.1"

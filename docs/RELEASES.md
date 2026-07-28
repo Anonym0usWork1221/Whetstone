@@ -31,15 +31,16 @@ nvidia-smi --query-gpu=name,compute_cap --format=csv
 ### Archive layout
 
 ```
-whetstone-0.2.0-linux-x86_64-sm75/
+whetstone-0.3.0-linux-x86_64-sm75/
 ├── bin/whetstone            the CLI (probe, inspect, convert, verify,
-│                             run, ppl, logits, bench, tune)
+│                             chat, run, ppl, logits, bench, tune)
 ├── bench/
 │   ├── chat.py              live chat + throughput benchmark
 │   ├── baseline_hf.py       HF baseline: tok/s, bandwidth, perplexity
 │   ├── reference_numpy.py   independent fp64 forward pass
 │   ├── tokenizer.py         byte-level BPE from tokenizer.json
 │   ├── prepare_tokens.py    materialise an evaluation token stream
+│   ├── compare.py           three-way comparison against llama.cpp and HF
 │   └── download_model.py    fetch the reference model
 ├── docs/{FORMAT,ROADMAP}.md
 ├── run.sh                   one launcher for everything
@@ -58,8 +59,8 @@ optional and needs its own environment — `./run.sh setup` builds one.
 ## Using a release
 
 ```bash
-tar xzf whetstone-0.2.0-linux-x86_64-sm75.tar.gz
-cd whetstone-0.2.0-linux-x86_64-sm75
+tar xzf whetstone-0.3.0-linux-x86_64-sm75.tar.gz
+cd whetstone-0.3.0-linux-x86_64-sm75
 
 ./run.sh doctor      # GPU, driver, binary, Python, model — all at once
 ./run.sh probe       # measured throughput of every arithmetic path
@@ -75,7 +76,7 @@ Full workflow:
 ./run.sh inspect  models/Qwen2.5-0.5B-Instruct   # architecture + roofline
 ./run.sh convert  models/Qwen2.5-0.5B-Instruct model.wstone
 ./run.sh verify   model.wstone models/Qwen2.5-0.5B-Instruct
-./run.sh chat                                    # live chat, tok/s readout
+./run.sh chat     model.wstone                   # live chat, tok/s per turn
 ./run.sh bench                                   # throughput run
 ```
 
@@ -86,7 +87,7 @@ sha256sum -c SHA256SUMS
 ```
 
 ```powershell
-(Get-FileHash -Algorithm SHA256 whetstone-0.2.0-windows-x86_64-sm75.zip).Hash
+(Get-FileHash -Algorithm SHA256 whetstone-0.3.0-windows-x86_64-sm75.zip).Hash
 ```
 
 ---
@@ -117,9 +118,9 @@ Both are checked by CI, and a mismatch fails the release before anything builds.
 
 ```bash
 # Cargo.toml [workspace.package]
-version = "0.3.0"
+version = "0.4.0"
 
-# CHANGELOG.md: move Unreleased items under a new ## [0.3.0] — YYYY-MM-DD
+# CHANGELOG.md: move Unreleased items under a new ## [0.4.0] — YYYY-MM-DD
 ```
 
 Record measured numbers in the changelog entry, not adjectives. "431.8 tok/s
@@ -131,10 +132,10 @@ perplexity worse is a trade the reader has to be able to see.
 
 ```bash
 git add -A
-git commit -m "Release 0.3.0"
-git tag -a v0.3.0 -m "Whetstone 0.3.0"
+git commit -m "Release 0.4.0"
+git tag -a v0.4.0 -m "Whetstone 0.4.0"
 git push origin main
-git push origin v0.3.0
+git push origin v0.4.0
 ```
 
 The tag push triggers `.github/workflows/release.yml`, which:

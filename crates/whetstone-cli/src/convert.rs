@@ -189,6 +189,18 @@ pub fn run(
         n_dense += 1;
     }
 
+    // Embed the tokenizer so the .wstone is genuinely self-contained: `whetstone
+    // chat model.wstone` should not need the original checkpoint on disk.
+    let tok_path = model_dir.join("tokenizer.json");
+    if tok_path.exists() {
+        let bytes = std::fs::read(&tok_path)?;
+        let n = bytes.len();
+        w.write_extra("tokenizer.json", &bytes).map_err(|e| anyhow::anyhow!("{e}"))?;
+        println!("  embedded tokenizer.json ({:.1} MB)", n as f64 / 1e6);
+    } else {
+        println!("  no tokenizer.json in the source; `whetstone chat` will need --tokenizer");
+    }
+
     let header = w.finish().map_err(|e| anyhow::anyhow!("{e}"))?;
     let elapsed = t0.elapsed();
 

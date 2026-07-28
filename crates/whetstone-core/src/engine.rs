@@ -79,8 +79,12 @@ struct Activations {
 pub enum Sampler {
     /// Highest logit. Stays entirely on the device.
     Greedy,
-    /// Temperature + nucleus sampling. Costs one 608 KB device-to-host copy per
-    /// token, which is ~3% of a 3 ms token — measurable, so it is opt-in.
+    /// Temperature + nucleus sampling, on the host.
+    ///
+    /// Costs a 608 KB device-to-host copy of the logits plus an O(vocab)
+    /// selection, measured at 369 tok/s against greedy's 467 — about 20%. That
+    /// is the price of a distribution the GPU cannot hand back cheaply, and it
+    /// is why `--temperature 0` exists.
     TopP {
         /// Softmax temperature.
         temperature: f32,
@@ -154,6 +158,8 @@ pub struct Engine {
     max_seq: usize,
     device: Device,
     graph: Option<decode::Graph>,
+    /// Reused by nucleus sampling so the token loop never allocates.
+    sample_order: Vec<u32>,
 }
 
 impl Engine {
@@ -187,7 +193,17 @@ impl Engine {
 
         let rope = decode::RopeTable::new(max_seq, hd, c.rope_theta as f64)?;
 
-        Ok(Self { weights, acts, caches, rope, pos: 0, max_seq, device, graph: None })
+        Ok(Self {
+            weights,
+            acts,
+            caches,
+            rope,
+            pos: 0,
+            max_seq,
+            device,
+            graph: None,
+            sample_order: Vec::new(),
+        })
     }
 
     /// Captures the whole decode step as a CUDA graph.
@@ -434,7 +450,14 @@ impl Engine {
             Sampler::Greedy => Ok(self.acts.token.get()? as u32),
             Sampler::TopP { temperature, top_p, seed } => {
                 let logits = self.logits()?;
-                let t = sample_top_p(&logits, temperature, top_p, seed, step);
+                let t = sample_top_p(
+                    &logits,
+                    temperature,
+                    top_p,
+                    seed,
+                    step,
+                    &mut self.sample_order,
+                );
                 // Put the choice where the next step's embedding gather looks.
                 self.acts.token.set(t as i32)?;
                 Ok(t)
@@ -510,50 +533,79 @@ impl Engine {
     }
 }
 
+/// Candidates considered for nucleus sampling.
+///
+/// Nucleus sampling needs the distribution in descending order, and sorting a
+/// 151936-entry vocabulary costs about 8 ms — **four times the entire forward
+/// pass**. `select_nth_unstable_by` partitions off the top `K` in O(n) and only
+/// those get sorted, which is O(n + K log K).
+///
+/// 512 is far more than a nucleus of p ≤ 0.95 reaches on this vocabulary; when
+/// the mass genuinely is that flat the effect is a top-k=512 filter, which is
+/// what every other engine applies anyway (llama.cpp defaults to top-k 40).
+const NUCLEUS_POOL: usize = 512;
+
 /// Temperature + nucleus sampling on the host.
 ///
-/// A full-precision softmax over the vocabulary, then the smallest prefix of the
-/// sorted distribution whose mass reaches `top_p`. Sorting 151936 candidates
-/// costs ~2 ms, which is why greedy is the default and this path is opt-in.
-fn sample_top_p(logits: &[f32], temperature: f32, top_p: f32, seed: u64, step: u64) -> u32 {
+/// `order` is caller-owned scratch so the token loop does not allocate 608 KB
+/// per token.
+fn sample_top_p(
+    logits: &[f32],
+    temperature: f32,
+    top_p: f32,
+    seed: u64,
+    step: u64,
+    order: &mut Vec<u32>,
+) -> u32 {
+    if logits.is_empty() {
+        return 0;
+    }
     if temperature <= 0.0 {
         return logits
             .iter()
             .enumerate()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
             .map_or(0, |(i, _)| i as u32);
     }
 
-    let mut idx: Vec<u32> = (0..logits.len() as u32).collect();
-    idx.sort_unstable_by(|&a, &b| {
-        logits[b as usize].partial_cmp(&logits[a as usize]).unwrap()
-    });
+    // Descending by logit. `unwrap_or(Equal)` rather than `unwrap`: a NaN logit
+    // means a broken model, and panicking inside the sampler turns that into a
+    // crash a long way from its cause.
+    let by_logit = |a: &u32, b: &u32| {
+        logits[*b as usize]
+            .partial_cmp(&logits[*a as usize])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    };
 
-    let max = logits[idx[0] as usize];
-    let mut probs = Vec::with_capacity(idx.len());
+    order.clear();
+    order.extend(0..logits.len() as u32);
+
+    let k = NUCLEUS_POOL.min(order.len());
+    if k < order.len() {
+        order.select_nth_unstable_by(k - 1, by_logit);
+        order.truncate(k);
+    }
+    order.sort_unstable_by(by_logit);
+
+    let max = logits[order[0] as usize] as f64;
+    let mut probs: Vec<f64> = Vec::with_capacity(k);
     let mut total = 0f64;
-    for &i in &idx {
-        let p = (((logits[i as usize] - max) / temperature) as f64).exp();
+    for &i in order.iter() {
+        let p = (((logits[i as usize] as f64) - max) / temperature as f64).exp();
         total += p;
         probs.push(p);
-        // The tail beyond top_p mass can never be selected, so stop building it.
-        if total / (total + 1e-300) >= 1.0 && probs.len() > 4096 {
+    }
+
+    // Smallest prefix whose mass reaches top_p.
+    let mut cut = probs.len();
+    let mut acc = 0f64;
+    for (i, &p) in probs.iter().enumerate() {
+        acc += p / total;
+        if acc >= top_p as f64 {
+            cut = i + 1;
             break;
         }
     }
-
-    let cut = {
-        let mut acc = 0f64;
-        let mut n = probs.len();
-        for (i, &p) in probs.iter().enumerate() {
-            acc += p / total;
-            if acc >= top_p as f64 {
-                n = i + 1;
-                break;
-            }
-        }
-        n
-    };
 
     let mass: f64 = probs[..cut].iter().sum();
     let u = splitmix64(seed ^ step.wrapping_mul(0x9E37_79B9_7F4A_7C15)) as f64
@@ -564,10 +616,10 @@ fn sample_top_p(logits: &[f32], temperature: f32, top_p: f32, seed: u64, step: u
     for i in 0..cut {
         acc += probs[i];
         if acc >= u {
-            return idx[i];
+            return order[i];
         }
     }
-    idx[cut.saturating_sub(1)]
+    order[cut.saturating_sub(1)]
 }
 
 /// SplitMix64. Deterministic, seeded, and one line — a full PRNG dependency for
@@ -605,7 +657,7 @@ mod tests {
     fn greedy_is_what_zero_temperature_means() {
         let mut l = vec![0.0f32; 64];
         l[37] = 5.0;
-        assert_eq!(sample_top_p(&l, 0.0, 0.9, 1, 0), 37);
+        assert_eq!(sample_top_p(&l, 0.0, 0.9, 1, 0, &mut Vec::new()), 37);
     }
 
     #[test]
@@ -615,15 +667,16 @@ mod tests {
         let mut l = vec![-20.0f32; 512];
         l[100] = 10.0;
         for seed in 0..32u64 {
-            assert_eq!(sample_top_p(&l, 1.0, 0.9, seed, seed), 100);
+            assert_eq!(sample_top_p(&l, 1.0, 0.9, seed, seed, &mut Vec::new()), 100);
         }
     }
 
     #[test]
     fn sampling_is_reproducible_for_a_seed() {
         let l: Vec<f32> = (0..1024).map(|i| ((i * 37 % 101) as f32) / 20.0).collect();
-        let a: Vec<u32> = (0..16).map(|s| sample_top_p(&l, 0.8, 0.95, 7, s)).collect();
-        let b: Vec<u32> = (0..16).map(|s| sample_top_p(&l, 0.8, 0.95, 7, s)).collect();
+        let mut sc = Vec::new();
+        let a: Vec<u32> = (0..16).map(|s| sample_top_p(&l, 0.8, 0.95, 7, s, &mut sc)).collect();
+        let b: Vec<u32> = (0..16).map(|s| sample_top_p(&l, 0.8, 0.95, 7, s, &mut sc)).collect();
         assert_eq!(a, b);
     }
 }

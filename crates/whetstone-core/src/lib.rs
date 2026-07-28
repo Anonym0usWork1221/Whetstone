@@ -25,9 +25,11 @@ pub mod engine;
 pub mod error;
 pub mod model;
 pub mod safetensors;
+pub mod tokenizer;
 
 pub use config::{ModelConfig, Roofline};
 pub use engine::{Engine, Profile, RunStats, Sampler};
 pub use error::{Error, Result};
 pub use model::{DeviceLinear, Embedding, LayerWeights, ModelWeights};
 pub use safetensors::{Dtype, SafeTensors, TensorView};
+pub use tokenizer::{StreamDecoder, Tokenizer};

@@ -215,6 +215,10 @@ pub struct ModelWeights {
     pub lm_head: Option<DeviceLinear>,
     /// Provenance from the header: quantization scheme, source path, and so on.
     pub quant_meta: std::collections::BTreeMap<String, String>,
+    /// The source `tokenizer.json`, when the converter embedded one.
+    ///
+    /// Carried so a `.wstone` needs no sidecar: text in, text out, from one file.
+    pub tokenizer_json: Option<String>,
 }
 
 impl ModelWeights {
@@ -326,7 +330,29 @@ impl ModelWeights {
             )));
         }
 
-        Ok(Self { config, layers, final_norm, embed, lm_head, quant_meta: header.quant })
+        let tokenizer_json = match header.extras.get("tokenizer.json") {
+            Some(b) => {
+                let lo = b.offset as usize;
+                let hi = lo + b.len as usize;
+                let raw = bytes.get(lo..hi).ok_or_else(|| {
+                    Error::Format("embedded tokenizer.json is out of range".into())
+                })?;
+                Some(String::from_utf8(raw.to_vec()).map_err(|e| {
+                    Error::Format(format!("embedded tokenizer.json is not UTF-8: {e}"))
+                })?)
+            }
+            None => None,
+        };
+
+        Ok(Self {
+            config,
+            layers,
+            final_norm,
+            embed,
+            lm_head,
+            quant_meta: header.quant,
+            tokenizer_json,
+        })
     }
 
     /// Bytes streamed per decode step, including the output projection.

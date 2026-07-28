@@ -11,6 +11,71 @@ Versioning is [semantic](https://semver.org/), with one project-specific rule:
 ## [Unreleased]
 
 ### Planned
+
+See [docs/ROADMAP.md](docs/ROADMAP.md) Stage 5. The engine is 1.50x llama.cpp
+Q4_K_M; the quantizer is 13x worse. Nothing else is worth doing first.
+
+---
+
+## [0.3.0] — 2026-07-28
+
+**Whetstone can now hold a conversation without Python.** `whetstone chat` is an
+interactive REPL that reports throughput per turn, and the tokenizer that makes
+it possible is written in Rust and verified token-for-token against the
+reference implementation.
+
+### Added
+
+- **`whetstone chat`** — an interactive REPL with tokens/second reported per
+  turn. The KV cache is kept across turns, so turn *n* prefills only its own
+  message instead of re-sending the transcript: re-sending is quadratic in
+  conversation length, and by turn ten most of the machine's time goes on
+  recomputing what it already knows.
+- **A byte-level BPE tokenizer in Rust**, read from `tokenizer.json`. Verified
+  by producing **token-for-token identical output to the reference
+  implementation across all 299,078 tokens** of wikitext-2. Whetstone's premise
+  is that no Python sits in the token loop; a chat REPL that shells out to
+  `transformers` for ids would have broken that at the first step.
+  - The pre-tokenizer is hand-written rather than a `Regex`: the pattern
+    `tokenizer.json` declares contains `\s+(?!\S)`, and Rust's `regex` crate
+    excludes negative lookahead by construction.
+  - `StreamDecoder` holds incomplete UTF-8 across tokens, so a multi-token
+    emoji streams as one character instead of replacement marks.
+- **The tokenizer is embedded in the `.wstone`** (7 MB), so `whetstone chat
+  model.wstone` needs no sidecar files. The header gained an `extras` section;
+  it is `#[serde(default)]` on both sides, so old files still load and old
+  readers ignore it — no format version bump, because `format::VERSION` moves
+  when a reader would *misinterpret* a file, not when the header grows.
+- `run.sh chat` / `run.bat chat` now drive the native REPL; the HuggingFace
+  harness moved to `hfchat`. `bench/compare.py` ships in the release archives.
+
+### Fixed
+
+- **`run.bat` passed every subcommand twice.** `shift` does not affect `%*` in
+  batch, so `run.bat probe --iters 100` invoked `whetstone probe probe --iters
+  100`, and `run.bat convert <dir> <out>` repeated both positional arguments
+  after the flags. Every label now collects its remaining arguments explicitly.
+  Delayed expansion is also switched off, because it eats `!` — and prompts
+  routinely contain one.
+- **The chat REPL emitted ANSI escapes unconditionally**, which show up as
+  literal `←[1m` on a Windows console that has not enabled virtual-terminal
+  processing, and as noise in a redirected file. Styling is now gated on
+  `IsTerminal`, `NO_COLOR`, and — on Windows — `WT_SESSION`. The per-turn stats
+  line is plain ASCII, since a console on codepage 437 renders UTF-8 punctuation
+  as mojibake.
+- **Nucleus sampling sorted the entire 151936-entry vocabulary on every token**,
+  costing ~8 ms — four times the forward pass it was sampling from — and capping
+  chat at 111 tok/s against greedy's 467. It now partitions off the top 512
+  candidates in O(n) with `select_nth_unstable_by` and sorts only those: **369
+  tok/s**. (The "early exit" that was supposed to bound the work ran *after* the
+  sort and its condition was always true, so it bounded nothing.)
+- `StreamDecoder` could wedge permanently on a malformed byte sequence: it held
+  bytes back whenever UTF-8 validation failed, including when the failure was
+  final rather than "incomplete so far". One bad byte would silence the stream
+  for the rest of the generation. It now distinguishes the two cases via
+  `Utf8Error::error_len`.
+
+### Planned
 - GPTQ with adequate calibration (~262k tokens). int4-g128 round-to-nearest
   costs **+2.75 perplexity** on this model, which is now the largest open number
   in the project — larger than any remaining speed win.
@@ -228,6 +293,7 @@ Qwen2.5-0.5B-Instruct:
 - `deploy.ps1` and `run.bat` are exercised by CI but have not been run
   interactively on Windows by the author.
 
-[Unreleased]: https://github.com/Anonym0usWork1221/Whetstone/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/Anonym0usWork1221/Whetstone/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/Anonym0usWork1221/Whetstone/releases/tag/v0.3.0
 [0.2.0]: https://github.com/Anonym0usWork1221/Whetstone/releases/tag/v0.2.0
 [0.1.0]: https://github.com/Anonym0usWork1221/Whetstone/releases/tag/v0.1.0

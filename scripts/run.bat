@@ -9,13 +9,17 @@ rem   run.bat run      <file.wstone> --ids   generate, and report tok/s
 rem   run.bat ppl      <file.wstone> --tokens <f>   wikitext-2 perplexity
 rem   run.bat tune     <file.wstone>         pick the per-shape GEMV kernel
 rem   run.bat tokens   [model_dir] [out]     tokenize wikitext-2 for ppl
-rem   run.bat chat     [model_dir]           interactive chat, live tok/s
+rem   run.bat chat     <file.wstone>         interactive chat, tok/s per turn
+rem   run.bat hfchat   [model_dir]           the HuggingFace chat harness
 rem   run.bat bench    [model_dir]           throughput run
 rem   run.bat download [dest]                fetch the reference model
 rem   run.bat setup                          create the Python venv
 rem   run.bat doctor                         diagnose the environment
 
-setlocal EnableDelayedExpansion
+rem Delayed expansion is deliberately NOT enabled: it would eat "!" in any
+rem argument, and prompts routinely contain one. Every %VAR% below is read after
+rem it is set, so nothing here needs it.
+setlocal
 
 set "HERE=%~dp0"
 set "HERE=%HERE:~0,-1%"
@@ -41,7 +45,8 @@ if "%CMD%"=="run"      goto :rust
 if "%CMD%"=="ppl"      goto :rust
 if "%CMD%"=="tune"     goto :rust
 if "%CMD%"=="tokens"   goto :tokens
-if "%CMD%"=="chat"     goto :chat
+if "%CMD%"=="chat"     goto :rust
+if "%CMD%"=="hfchat"   goto :chat
 if "%CMD%"=="bench"    goto :bench
 if "%CMD%"=="baseline" goto :baseline
 if "%CMD%"=="download" goto :download
@@ -72,8 +77,18 @@ exit /b 0
 rem ------------------------------------------------------------- rust paths
 
 :rust
+rem `shift` does not affect %*, so passing %* here would repeat the subcommand:
+rem `run.bat probe --iters 100` became `whetstone probe probe --iters 100`.
+rem Collect the remaining arguments one at a time instead.
 call :need_bin || exit /b 1
-"%BIN%" %CMD% %*
+set "ARGS="
+:rust_collect
+if "%~1"=="" goto :rust_go
+set "ARGS=%ARGS% "%~1""
+shift
+goto :rust_collect
+:rust_go
+"%BIN%" %CMD%%ARGS%
 exit /b %ERRORLEVEL%
 
 :tokens
@@ -84,7 +99,14 @@ if not "%~1"=="" shift
 set "OUT=%~1"
 if "%OUT%"=="" set "OUT=%HERE%\tokens.u32"
 if not "%~1"=="" shift
-"%PY%" "%BENCH%\prepare_tokens.py" --model "%MODEL%" --out "%OUT%" %*
+set "ARGS="
+:tokens_collect
+if "%~1"=="" goto :tokens_go
+set "ARGS=%ARGS% "%~1""
+shift
+goto :tokens_collect
+:tokens_go
+"%PY%" "%BENCH%\prepare_tokens.py" --model "%MODEL%" --out "%OUT%"%ARGS%
 exit /b %ERRORLEVEL%
 
 :convert
@@ -99,7 +121,14 @@ if not exist "%MODEL%" (
 shift
 set "OUT=%~1"
 if "%OUT%"=="" (set "OUT=%HERE%\model.wstone") else (shift)
-"%BIN%" convert "%MODEL%" -o "%OUT%" %*
+set "ARGS="
+:convert_collect
+if "%~1"=="" goto :convert_go
+set "ARGS=%ARGS% "%~1""
+shift
+goto :convert_collect
+:convert_go
+"%BIN%" convert "%MODEL%" -o "%OUT%"%ARGS%
 exit /b %ERRORLEVEL%
 
 :verify
@@ -120,21 +149,42 @@ rem ----------------------------------------------------------- python paths
 call :need_py || exit /b 1
 call :resolve_model %1 || exit /b 1
 if not "%~1"=="" shift
-"%PY%" "%BENCH%\chat.py" --model "%MODEL%" %*
+set "ARGS="
+:hfchat_collect
+if "%~1"=="" goto :hfchat_go
+set "ARGS=%ARGS% "%~1""
+shift
+goto :hfchat_collect
+:hfchat_go
+"%PY%" "%BENCH%\chat.py" --model "%MODEL%"%ARGS%
 exit /b %ERRORLEVEL%
 
 :bench
 call :need_py || exit /b 1
 call :resolve_model %1 || exit /b 1
 if not "%~1"=="" shift
-"%PY%" "%BENCH%\chat.py" --model "%MODEL%" --bench %*
+set "ARGS="
+:bench_collect
+if "%~1"=="" goto :bench_go
+set "ARGS=%ARGS% "%~1""
+shift
+goto :bench_collect
+:bench_go
+"%PY%" "%BENCH%\chat.py" --model "%MODEL%" --bench%ARGS%
 exit /b %ERRORLEVEL%
 
 :baseline
 call :need_py || exit /b 1
 call :resolve_model %1 || exit /b 1
 if not "%~1"=="" shift
-"%PY%" "%BENCH%\baseline_hf.py" --model "%MODEL%" %*
+set "ARGS="
+:baseline_collect
+if "%~1"=="" goto :baseline_go
+set "ARGS=%ARGS% "%~1""
+shift
+goto :baseline_collect
+:baseline_go
+"%PY%" "%BENCH%\baseline_hf.py" --model "%MODEL%"%ARGS%
 exit /b %ERRORLEVEL%
 
 :download

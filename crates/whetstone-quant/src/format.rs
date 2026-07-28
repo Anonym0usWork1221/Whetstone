@@ -135,6 +135,15 @@ pub struct Header {
     pub quant: BTreeMap<String, String>,
     /// Tensor directory, sorted by name.
     pub tensors: Vec<TensorEntry>,
+    /// Non-tensor payloads, by name. Currently `tokenizer.json`.
+    ///
+    /// `#[serde(default)]` on both sides of the change: a reader built before
+    /// this field existed ignores it, and a reader built after it accepts a file
+    /// written without it. That is why adding this did not need a format version
+    /// bump — the rule is that `format::VERSION` moves when a reader would
+    /// *misinterpret* an old file, not merely when the header grows.
+    #[serde(default)]
+    pub extras: BTreeMap<String, Blob>,
 }
 
 impl Header {
@@ -201,6 +210,7 @@ pub struct Writer<W: Write + Seek> {
     out: W,
     cursor: u64,
     entries: Vec<TensorEntry>,
+    extras: BTreeMap<String, Blob>,
     model_config: serde_json::Value,
     quant: BTreeMap<String, String>,
     header_reserve: u64,
@@ -218,6 +228,7 @@ impl<W: Write + Seek> Writer<W> {
             out,
             cursor: start,
             entries: Vec::new(),
+            extras: BTreeMap::new(),
             model_config,
             quant: BTreeMap::new(),
             header_reserve,
@@ -291,6 +302,17 @@ impl<W: Write + Seek> Writer<W> {
         Ok(())
     }
 
+    /// Appends a non-tensor payload, such as the source `tokenizer.json`.
+    ///
+    /// The format's premise is that a `.wstone` needs no sidecar files. A model
+    /// that cannot turn text into ids without one is only three-quarters
+    /// self-contained, and the tokenizer is 7 MB against a 263 MB file.
+    pub fn write_extra(&mut self, name: &str, bytes: &[u8]) -> Result<()> {
+        let blob = self.write_blob(bytes)?;
+        self.extras.insert(name.into(), blob);
+        Ok(())
+    }
+
     /// Writes the header and finishes the file.
     pub fn finish(mut self) -> Result<Header> {
         self.entries.sort_by(|a, b| a.name.cmp(&b.name));
@@ -302,6 +324,7 @@ impl<W: Write + Seek> Writer<W> {
             model_config: self.model_config.clone(),
             quant: self.quant.clone(),
             tensors: self.entries.clone(),
+            extras: self.extras.clone(),
         };
 
         let json = serde_json::to_vec(&header)
@@ -385,6 +408,17 @@ pub fn read_header(bytes: &[u8], file_len: u64) -> Result<Header> {
         .map_err(|e| Error::Format(format!("malformed header JSON: {e}")))?;
 
     // Validate every declared range before anyone indexes with it.
+    for (name, b) in &header.extras {
+        let last = b
+            .offset
+            .checked_add(b.len)
+            .ok_or_else(|| Error::Format(format!("extra {name:?}: range overflows")))?;
+        if last > file_len {
+            return Err(Error::Format(format!(
+                "extra {name:?} ends at {last} but the file is {file_len} bytes"
+            )));
+        }
+    }
     for t in &header.tensors {
         for (blob_name, b) in &t.blobs {
             let last = b
@@ -426,6 +460,16 @@ pub fn read_header(bytes: &[u8], file_len: u64) -> Result<Header> {
 ///
 /// Linear in file size, so it is opt-in rather than automatic on load.
 pub fn verify_payloads(header: &Header, file: &[u8]) -> Result<()> {
+    for (name, b) in &header.extras {
+        let lo = b.offset as usize;
+        let hi = lo + b.len as usize;
+        if hi > file.len() {
+            return Err(Error::Format(format!("extra {name:?}: range past end of file")));
+        }
+        if fnv1a(&file[lo..hi]) != b.hash {
+            return Err(Error::Format(format!("extra {name:?}: checksum mismatch")));
+        }
+    }
     for t in &header.tensors {
         for (name, b) in &t.blobs {
             let lo = b.offset as usize;
@@ -502,6 +546,37 @@ mod tests {
         let qw = gate.blob("qw").unwrap();
         let stored = &bytes[qw.offset as usize..(qw.offset + qw.len) as usize];
         assert_eq!(stored, bytemuck_cast(&packed.qw));
+    }
+
+    #[test]
+    fn extras_round_trip_and_old_files_still_load() {
+        let w = vec![0.1f32; 128];
+        let packed = crate::quantize_int4_g128(&w, 128, 1).unwrap();
+        let mut buf = Cursor::new(Vec::new());
+        {
+            let mut writer = Writer::new(&mut buf, sample_config(), 8192).unwrap();
+            writer.write_int4("a", &packed).unwrap();
+            writer.write_extra("tokenizer.json", br#"{"model":{}}"#).unwrap();
+            writer.finish().unwrap();
+        }
+        let bytes = buf.into_inner();
+        let h = read_header(&bytes, bytes.len() as u64).unwrap();
+        verify_payloads(&h, &bytes).unwrap();
+
+        let e = h.extras.get("tokenizer.json").expect("extra missing");
+        assert_eq!(
+            &bytes[e.offset as usize..(e.offset + e.len) as usize],
+            br#"{"model":{}}"#
+        );
+
+        // A header written before `extras` existed must still parse: the field
+        // is `#[serde(default)]` precisely so this needs no version bump.
+        let json = serde_json::json!({
+            "format": "wstone", "version": VERSION, "producer": "test",
+            "model_config": sample_config(), "quant": {}, "tensors": []
+        });
+        let old: Header = serde_json::from_value(json).unwrap();
+        assert!(old.extras.is_empty());
     }
 
     #[test]

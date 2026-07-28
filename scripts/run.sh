@@ -10,7 +10,8 @@
 #   ./run.sh ppl      <file.wstone> <toks>  wikitext-2 perplexity
 #   ./run.sh tune     <file.wstone>         pick the per-shape GEMV kernel
 #   ./run.sh tokens   [model_dir] [out]     tokenize wikitext-2 for ppl
-#   ./run.sh chat     [model_dir]           interactive chat, live tok/s
+#   ./run.sh chat     <file.wstone>         interactive chat, tok/s per turn
+#   ./run.sh hfchat   [model_dir]           the HuggingFace chat harness
 #   ./run.sh bench    [model_dir]           throughput run
 #   ./run.sh download [dest]                fetch the reference model
 #   ./run.sh setup                          create the Python venv
@@ -23,6 +24,7 @@
 #
 #   ./run.sh download
 #   ./run.sh convert models/Qwen2.5-0.5B-Instruct model.wstone --head int4
+#   ./run.sh chat    model.wstone
 #   ./run.sh run     model.wstone --ids 785,6722,315,9625,374 --max-new 256 --graph
 #   ./run.sh tokens  models/Qwen2.5-0.5B-Instruct wikitext2.u32
 #   ./run.sh ppl     model.wstone wikitext2.u32
@@ -113,6 +115,14 @@ case "$cmd" in
         ;;
 
     chat)
+        # Native, not bench/chat.py: the whole point is that no Python sits in
+        # the token loop, and the binary carries its own tokenizer.
+        need_bin
+        f="${1:?usage: run.sh chat <file.wstone> [--temperature 0] [--ctx N]}"; shift || true
+        exec "$BIN" chat "$f" "$@"
+        ;;
+
+    hfchat)
         need_py
         model="$(resolve_model "${1:-}")"; [[ $# -gt 0 ]] && shift || true
         exec "$PY" "$BENCH/chat.py" --model "$model" "$@"
