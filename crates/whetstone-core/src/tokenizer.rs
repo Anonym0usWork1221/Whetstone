@@ -137,7 +137,7 @@ impl Tokenizer {
         }
         // Longest first: a shorter special must never win over a longer one that
         // starts at the same place.
-        specials.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+        specials.sort_by_key(|(text, _)| std::cmp::Reverse(text.len()));
 
         let mut inv = vec![String::new(); max_id as usize + 1];
         for (tok, &id) in &vocab {

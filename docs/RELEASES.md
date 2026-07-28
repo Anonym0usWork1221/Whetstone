@@ -112,6 +112,18 @@ And a real end-to-end check:
 ./target/release/whetstone verify /tmp/m.wstone --source ../models/Qwen2.5-0.5B-Instruct
 ```
 
+> **Update your toolchain first.** CI uses `dtolnay/rust-toolchain@stable`,
+> which floats. A local stable a few months behind will miss lints CI enforces —
+> that is how v0.3.0 was tagged with a clippy failure in it.
+>
+> ```bash
+> rustup update stable
+> cargo clippy --release --all-targets --locked -- -D warnings
+> ```
+>
+> `scripts/deploy.sh` now runs that same command and refuses to package if it
+> fails.
+
 ### 2. Update the version and changelog
 
 Both are checked by CI, and a mismatch fails the release before anything builds.

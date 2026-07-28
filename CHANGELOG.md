@@ -51,6 +51,12 @@ reference implementation.
 
 ### Fixed
 
+- **A clippy failure that only a newer toolchain caught.**
+  `unnecessary_sort_by` in the tokenizer passed under a local stable from March
+  and failed CI's July stable. `scripts/deploy.sh` now runs
+  `cargo clippy --release --all-targets --locked -- -D warnings` — the exact CI
+  command — and refuses to package if it fails. A release preflight weaker than
+  CI is not a preflight; it just moves the discovery to after the tag is public.
 - **`run.bat` passed every subcommand twice.** `shift` does not affect `%*` in
   batch, so `run.bat probe --iters 100` invoked `whetstone probe probe --iters
   100`, and `run.bat convert <dir> <out>` repeated both positional arguments

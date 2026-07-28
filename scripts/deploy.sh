@@ -106,6 +106,25 @@ cargo build --release --locked 2>&1 | grep -Ev '^\s*(Compiling|Finished)' || tru
 [[ -x target/release/whetstone ]] || die "build produced no binary"
 ok "built target/release/whetstone"
 
+# Exactly what CI runs, and it must be exactly that.
+#
+# This step was missing when v0.3.0 was tagged: the build and the tests passed
+# locally, CI ran clippy on a newer stable, and `unnecessary_sort_by` failed the
+# release. A preflight that is weaker than CI is not a preflight -- it just moves
+# the discovery to after the tag is public.
+#
+# Note the toolchain floats: CI uses `dtolnay/rust-toolchain@stable`, so a local
+# stable that is a few months old will miss lints CI enforces. Run
+# `rustup update stable` before tagging.
+info "clippy (same flags as CI)"
+rustc --version | sed 's/^/  local /'
+if ! cargo clippy --release --all-targets --locked -- -D warnings 2>&1 \
+     | grep -E '^(error|warning)' | sed 's/^/  /'; then
+    ok "clippy clean"
+else
+    die "clippy failed -- CI will fail too. Fix before tagging."
+fi
+
 if [[ "$SKIP_TESTS" -eq 0 ]]; then
     info "running correctness tests"
     cargo test --release --locked 2>&1 | grep -E "test result:" | sed 's/^/  /'
