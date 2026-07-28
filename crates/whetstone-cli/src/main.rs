@@ -72,7 +72,7 @@ enum Command {
         head: convert::HeadPrecision,
         /// Precision for the transformer blocks. fp16 is the lossless reference
         /// path: it is what separates an engine bug from quantization damage.
-        #[arg(long, value_enum, default_value_t = convert::BodyPrecision::Int4)]
+        #[arg(long, value_enum, default_value_t = convert::BodyPrecision::Int4Hier)]
         body: convert::BodyPrecision,
         /// Memory bandwidth in GB/s for the reported ceiling.
         #[arg(long)]

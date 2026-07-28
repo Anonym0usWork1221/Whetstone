@@ -31,7 +31,7 @@ nvidia-smi --query-gpu=name,compute_cap --format=csv
 ### Archive layout
 
 ```
-whetstone-0.3.0-linux-x86_64-sm75/
+whetstone-0.4.0-linux-x86_64-sm75/
 ├── bin/whetstone            the CLI (probe, inspect, convert, verify,
 │                             chat, run, ppl, logits, bench, tune)
 ├── bench/
@@ -59,8 +59,8 @@ optional and needs its own environment — `./run.sh setup` builds one.
 ## Using a release
 
 ```bash
-tar xzf whetstone-0.3.0-linux-x86_64-sm75.tar.gz
-cd whetstone-0.3.0-linux-x86_64-sm75
+tar xzf whetstone-0.4.0-linux-x86_64-sm75.tar.gz
+cd whetstone-0.4.0-linux-x86_64-sm75
 
 ./run.sh doctor      # GPU, driver, binary, Python, model — all at once
 ./run.sh probe       # measured throughput of every arithmetic path
@@ -87,7 +87,7 @@ sha256sum -c SHA256SUMS
 ```
 
 ```powershell
-(Get-FileHash -Algorithm SHA256 whetstone-0.3.0-windows-x86_64-sm75.zip).Hash
+(Get-FileHash -Algorithm SHA256 whetstone-0.4.0-windows-x86_64-sm75.zip).Hash
 ```
 
 ---

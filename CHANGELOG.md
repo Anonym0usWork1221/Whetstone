@@ -10,10 +10,79 @@ Versioning is [semantic](https://semver.org/), with one project-specific rule:
 
 ## [Unreleased]
 
-### Planned
+Nothing yet.
 
-See [docs/ROADMAP.md](docs/ROADMAP.md) Stage 5. The engine is 1.50x llama.cpp
-Q4_K_M; the quantizer is 13x worse. Nothing else is worth doing first.
+---
+
+## [0.4.0] — 2026-07-28
+
+**The quantizer caught up with the engine.** 0.3.0 was 1.53x llama.cpp
+Q4_K_M at 10.6x its quantization damage. 0.4.0 is 1.46x at 2.1x, from a new
+weight format that costs 0.03 bits/weight.
+
+### Added
+
+- **`Int4HierG32` — a new weight format, and the new default for `convert`.**
+  int4 with group 32, where each group stores a 4-bit scale index and a 4-bit
+  minimum index against one fp16 `(d, dmin)` pair per row:
+  `scale = d*ls`, `min = -dmin*lm`, `w = q*scale + min`. That is
+  `4 + 8/32 + 32/in_features` bits per weight — **4.28 against the old format's
+  4.25** — and it measured **1.15 perplexity better** on the transformer body.
+
+  Group size turned out to be worth roughly six times what the fitting algorithm
+  is worth (group 128 → 64 buys 0.96 perplexity; llama.cpp's complete k-quant
+  alternating least-squares fit at fixed group size buys 0.16), and the reason
+  the old format could not use it is that an fp16 scale plus an fp16 zero per
+  group of 32 costs 1.0 bits/weight of metadata against group 128's 0.25.
+  Small unsigned indices against a per-row pair is what makes it affordable.
+
+  `--body int4` still selects the group-128 format so an A/B is one flag.
+
+- **`quantize_int4_hier` / `dequantize_int4_hier`** in `whetstone-quant`, and
+  `QuantLinearHier` plus `cuda/gemv_hier.cu` in `whetstone-kernels`. The GEMV
+  computes the per-group activation sums *inside* the reduction rather than in a
+  prologue kernel — the lane that owns a group has already loaded exactly the 32
+  activations it needs to sum, and that sum is shared across every row the warp
+  accumulates — so the format change added no kernel launches, no scratch buffer
+  and no API change.
+
+- `whetstone verify` reads both quantized formats, and rejects a rank-1 tensor
+  declared as quantized instead of indexing out of bounds.
+
+### Changed
+
+- Measured end to end, 384 generated tokens, median of four interleaved rounds
+  against llama.cpp on the same GPU in the same run. Perplexity is wikitext-2,
+  20 × 2048-token windows; llama.cpp's row is **its own weights measured in this
+  harness**, not a number quoted from `llama-perplexity`, because that tool
+  scores only the second half of each window and the two are not comparable.
+
+  | format | bytes/token | bits/wt | tok/s | ppl | Δ vs own fp16 |
+  |---|---|---|---|---|---|
+  | llama.cpp Q4_K_M | 392 MB | 6.35 | 283.8 | 14.2138 | +0.396 |
+  | int4-g128 (0.3.0) | 262 MB | 4.25 | 434.1 | 18.0287 | +4.208 |
+  | **int4-hier-g32** | 264 MB | 4.28 | 415.2 | 16.0220 | +2.201 |
+  | **int4-hier-g32 + GPTQ** | 264 MB | 4.28 | 414.0 | 14.6383 | **+0.817** |
+
+  **1.46× llama.cpp Q4_K_M at 2.06× its quantization damage**, against 0.3.0's
+  1.53× at 10.6×. The new format costs 4.6% throughput for a 5.1× reduction in
+  damage at the same width.
+
+- The `.wstone` header checksum's multiplier is documented as **not** the FNV-1a
+  prime — `0x1000_0000_01b3` is one hex digit longer than `0x100000001b3`. It is
+  deliberately left alone (changing it would invalidate every existing file for
+  no benefit, since its only job is detecting corruption) and now says so, so it
+  does not get "fixed". An independent reimplementation of the container is what
+  surfaced it.
+
+### Notes
+
+- **Weight relative error is not a quality measure.** A clip search that lowers
+  mean weight error from 0.1102 to 0.1067 raises perplexity by 0.50; GPTQ raises
+  weight error to 0.1416 and lowers perplexity by 1.73. `convert` still reports
+  it, as a smoke test for a broken packer and nothing more.
+- GPTQ is an offline step and does not change the weight format. The tooling
+  lives outside this repo, in the research tree, and writes the same container.
 
 ---
 

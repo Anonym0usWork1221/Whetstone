@@ -313,3 +313,128 @@ fn negative_logits_are_ordered_correctly() {
     argmax(&d, &mut idx).unwrap();
     assert_eq!(idx.to_vec().unwrap()[0], 0);
 }
+
+/// The hierarchical int4 GEMV must agree with its own dequantized reference.
+///
+/// This is the §7 gate for a new numeric path, and it is worth being specific
+/// about what it can catch that a perplexity run cannot. The kernel does three
+/// things no other kernel here does: it derives the scale as `d*ls` from a
+/// 4-bit index, it computes the group sum of the activations *inside* the
+/// reduction rather than in a prologue, and it re-centres the levels on 8 so the
+/// fp16 accumulator stays balanced. Any of those can be wrong in a way that
+/// still produces fluent text and moves perplexity by a few hundredths.
+///
+/// Every shape Qwen2.5-0.5B issues is exercised, because the kernel's tile rule
+/// branches on shape and a rule that mis-selects only for `down_proj` would
+/// otherwise pass.
+#[test]
+fn hierarchical_gemv_matches_the_dequantized_reference() {
+    use whetstone_kernels::gemv::QuantLinearHier;
+    use whetstone_kernels::{DeviceBuffer, Device};
+
+    if Device::default_device().is_err() {
+        eprintln!("skip: no CUDA device");
+        return;
+    }
+
+    // (in, out) for q|k|v fused, o, gate|up fused, down, and a head-sized slice.
+    for &(in_f, out_f) in &[
+        (896usize, 1152usize),
+        (896, 896),
+        (896, 9728),
+        (4864, 896),
+        (896, 4096),
+    ] {
+        let w: Vec<f32> = (0..in_f * out_f)
+            .map(|i| {
+                let a = ((i * 2_654_435_761usize) % 10_000) as f32 / 10_000.0 - 0.5;
+                let b = ((i * 40_503usize) % 977) as f32 / 977.0 - 0.5;
+                a * 0.15 + b * b * b * 0.5
+            })
+            .collect();
+        // Activation magnitudes an RMSNorm actually emits. The fp16 accumulator
+        // inside the kernel is only safe at realistic scales, so testing with
+        // unit-magnitude inputs would not exercise the thing that could break.
+        let x: Vec<f32> = (0..in_f)
+            .map(|i| (((i * 7919) % 401) as f32 / 200.0 - 1.0) * 2.5)
+            .collect();
+
+        let packed = whetstone_quant::quantize_int4_hier(&w, in_f, out_f).unwrap();
+        let dequant = whetstone_quant::dequantize_int4_hier(&packed);
+
+        let xh: Vec<u16> = x.iter().map(|&v| half::f16::from_f32(v).to_bits()).collect();
+        let x_dev = DeviceBuffer::from_slice(&xh).unwrap();
+        let mut y_dev = DeviceBuffer::<f32>::zeros(out_f).unwrap();
+
+        let layer =
+            QuantLinearHier::from_packed(&packed.qw, &packed.si, &packed.sb, in_f, out_f).unwrap();
+        layer.gemv(&x_dev, &mut y_dev).unwrap();
+        let got = y_dev.to_vec().unwrap();
+
+        // The reference uses the SAME dequantized weights, so any disagreement
+        // is a kernel bug, not quantization error.
+        let mut worst = 0.0f32;
+        for r in 0..out_f {
+            let want: f32 = (0..in_f)
+                .map(|c| dequant[r * in_f + c] * half::f16::from_f32(x[c]).to_f32())
+                .sum();
+            let scale: f32 = (0..in_f)
+                .map(|c| (dequant[r * in_f + c] * x[c]).abs())
+                .sum();
+            // fp16 products and an fp16 partial sum inside each group: the error
+            // scales with the sum of magnitudes, not with the (cancelling) result.
+            let tol = 4e-3 * scale.max(1.0);
+            worst = worst.max((got[r] - want).abs() / tol);
+            assert!(
+                (got[r] - want).abs() < tol,
+                "{in_f}x{out_f} row {r}: kernel {} vs reference {want} (tol {tol})",
+                got[r]
+            );
+        }
+        eprintln!("  {in_f}x{out_f}: worst error {:.2}x tolerance", worst);
+    }
+}
+
+/// Every tile rule must produce the same answer, not just the default one.
+#[test]
+fn hierarchical_gemv_agrees_across_tile_rules() {
+    use whetstone_kernels::gemv::{self, QuantLinearHier};
+    use whetstone_kernels::{DeviceBuffer, Device};
+
+    if Device::default_device().is_err() {
+        eprintln!("skip: no CUDA device");
+        return;
+    }
+    let (in_f, out_f) = (896usize, 1152usize);
+    let w: Vec<f32> = (0..in_f * out_f)
+        .map(|i| ((i * 2_654_435_761usize) % 1000) as f32 / 500.0 - 1.0)
+        .collect();
+    let x: Vec<f32> = (0..in_f).map(|i| ((i * 40_503) % 200) as f32 / 100.0 - 1.0).collect();
+
+    let packed = whetstone_quant::quantize_int4_hier(&w, in_f, out_f).unwrap();
+    let xh: Vec<u16> = x.iter().map(|&v| half::f16::from_f32(v).to_bits()).collect();
+    let x_dev = DeviceBuffer::from_slice(&xh).unwrap();
+    let layer =
+        QuantLinearHier::from_packed(&packed.qw, &packed.si, &packed.sb, in_f, out_f).unwrap();
+
+    let saved = gemv::hier_get_rule();
+    let mut reference: Option<Vec<f32>> = None;
+    for tile in 0..3 {
+        gemv::hier_set_rule(tile, tile, tile);
+        let mut y = DeviceBuffer::<f32>::zeros(out_f).unwrap();
+        layer.gemv(&x_dev, &mut y).unwrap();
+        let got = y.to_vec().unwrap();
+        match &reference {
+            None => reference = Some(got),
+            Some(r) => {
+                for (i, (a, b)) in r.iter().zip(&got).enumerate() {
+                    assert!(
+                        (a - b).abs() < 1e-3 * a.abs().max(1.0),
+                        "tile rule {tile} disagrees at row {i}: {b} vs {a}"
+                    );
+                }
+            }
+        }
+    }
+    gemv::hier_set_rule(saved[0], saved[1], saved[2]);
+}

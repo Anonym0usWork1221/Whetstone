@@ -405,6 +405,200 @@ pub fn bench_gemv(in_f: usize, out_f: usize, reps: i32, int4: bool) -> Result<Ge
     Ok(GemvBench { gbs, ms })
 }
 
+// ---------------------------------------------------------------- hierarchical
+
+/// Weights per `(ls, lm)` index pair in the hierarchical int4 format.
+///
+/// Not tunable: 32 nibbles is exactly one `uint4`, so a lane handles precisely
+/// one group per load and the metadata read is one byte per lane.
+pub const HGROUP: usize = 32;
+
+/// An int4 linear layer with hierarchical scale metadata.
+///
+/// Layout, matching `cuda/gemv_hier.cu`:
+/// - `qw`: `[out_features][in_features/8]` `u32`, eight nibbles per word
+/// - `si`: `[out_features][in_features/32]` `u8`, scale index low, min index high
+/// - `sb`: `[out_features]` `u32`, an fp16 `d` low and an fp16 `dmin` high
+///
+/// Reconstruction is `w = q*(d*ls) - dmin*lm`. See `whetstone-quant::hier` for
+/// why this format replaces the flat group-128 one: it buys group-32 granularity
+/// for 0.036 bits/weight, and granularity measured six times more valuable than
+/// the fitting algorithm.
+pub struct QuantLinearHier {
+    qw: DeviceBuffer<u32>,
+    si: DeviceBuffer<u8>,
+    sb: DeviceBuffer<u32>,
+    in_features: usize,
+    out_features: usize,
+}
+
+impl QuantLinearHier {
+    /// Uploads a pre-packed matrix, validating every array against the shape.
+    pub fn from_packed(
+        qw: &[u32],
+        si: &[u8],
+        sb: &[u32],
+        in_features: usize,
+        out_features: usize,
+    ) -> Result<Self> {
+        if in_features % HGROUP != 0 {
+            return Err(Error::Shape(format!(
+                "in_features {in_features} must be a multiple of {HGROUP}"
+            )));
+        }
+        let (want_qw, want_si, want_sb) = (
+            out_features * in_features / 8,
+            out_features * in_features / HGROUP,
+            out_features,
+        );
+        if qw.len() != want_qw || si.len() != want_si || sb.len() != want_sb {
+            return Err(Error::Shape(format!(
+                "hierarchical int4 arrays are {}/{}/{}, expected {want_qw}/{want_si}/{want_sb}",
+                qw.len(),
+                si.len(),
+                sb.len()
+            )));
+        }
+        Ok(Self {
+            qw: DeviceBuffer::from_slice(qw)?,
+            si: DeviceBuffer::from_slice(si)?,
+            sb: DeviceBuffer::from_slice(sb)?,
+            in_features,
+            out_features,
+        })
+    }
+
+    /// Input width.
+    pub fn in_features(&self) -> usize {
+        self.in_features
+    }
+
+    /// Output width.
+    pub fn out_features(&self) -> usize {
+        self.out_features
+    }
+
+    /// Weight bytes streamed per invocation, including all scale metadata.
+    pub fn bytes(&self) -> usize {
+        self.qw.bytes() + self.si.bytes() + self.sb.bytes()
+    }
+
+    /// Effective bits per weight.
+    pub fn bits_per_weight(&self) -> f64 {
+        self.bytes() as f64 * 8.0 / (self.in_features * self.out_features) as f64
+    }
+
+    /// Dequantizes one row — the input gather when the tied matrix lives here.
+    pub fn gather_row(
+        &self,
+        row: &crate::decode::DeviceCursor,
+        out: &mut DeviceBuffer<f32>,
+    ) -> Result<()> {
+        if out.len() != self.in_features {
+            return Err(Error::Shape(format!(
+                "gather_row: output has {} elements, row width is {}",
+                out.len(),
+                self.in_features
+            )));
+        }
+        crate::decode::embed_int4_hier(&self.qw, &self.si, &self.sb, row, out)
+    }
+
+    /// `y = W x + b`, or `y += W x + b` when `accumulate`.
+    pub fn gemv_ex(
+        &self,
+        x: &DeviceBuffer<u16>,
+        bias: Option<&DeviceBuffer<u16>>,
+        y: &mut DeviceBuffer<f32>,
+        accumulate: bool,
+    ) -> Result<()> {
+        if x.len() != self.in_features {
+            return Err(Error::Shape(format!(
+                "x has {} elements, expected {}",
+                x.len(),
+                self.in_features
+            )));
+        }
+        if y.len() != self.out_features {
+            return Err(Error::Shape(format!(
+                "y has {} elements, expected {}",
+                y.len(),
+                self.out_features
+            )));
+        }
+        if let Some(b) = bias {
+            if b.len() != self.out_features {
+                return Err(Error::Shape(format!(
+                    "bias has {} elements, expected {}",
+                    b.len(),
+                    self.out_features
+                )));
+            }
+        }
+        let bias_ptr = bias.map_or(std::ptr::null(), DeviceBuffer::as_ptr);
+        // SAFETY: shapes are validated above against the buffers' real lengths,
+        // the bias pointer is null exactly when no bias was supplied, and the
+        // kernel writes only y[0..out_features].
+        check(unsafe {
+            ffi::wst_gemv_int4_hier_ex(
+                self.qw.as_ptr(),
+                self.si.as_ptr(),
+                self.sb.as_ptr(),
+                x.as_ptr(),
+                bias_ptr,
+                y.as_mut_ptr(),
+                self.in_features as i32,
+                self.out_features as i32,
+                i32::from(accumulate),
+            )
+        })
+    }
+
+    /// `y = W x`.
+    pub fn gemv(&self, x: &DeviceBuffer<u16>, y: &mut DeviceBuffer<f32>) -> Result<()> {
+        self.gemv_ex(x, None, y, false)
+    }
+}
+
+/// The rows-per-warp rule for the hierarchical kernel, as three tile indices
+/// (0 → 1 row, 1 → 2 rows, 2 → 4 rows) for wide-reduction, huge-output and
+/// everything-else shapes.
+///
+/// Exposed for sweeping, because the trade this rule makes — in-flight bytes
+/// against warp-level parallelism — depends on the shape, and the only
+/// measurement that has ever ranked these correctly is whole-generation
+/// throughput. A microbenchmark exaggerates the spread by more than an order of
+/// magnitude and the per-stage event profiler reorders it.
+pub fn hier_set_rule(wide: i32, huge: i32, other: i32) {
+    // SAFETY: a plain store into three process-global ints in the CUDA module.
+    unsafe { ffi::wst_gemv_hier_set_rule(wide, huge, other) }
+}
+
+/// Applies `WHETSTONE_HIER_RULE=wide,huge,other` if it is set.
+///
+/// Sweeping this rule needs the *whole generation* to be re-run per candidate --
+/// a microbenchmark exaggerates the spread by more than an order of magnitude
+/// and the per-stage event profiler reorders it, both measured on the g128
+/// kernel. An environment variable is the cheapest thing that makes "run the
+/// engine 64 times with different rules" a shell loop instead of 64 rebuilds.
+pub fn hier_rule_from_env() {
+    let Ok(v) = std::env::var("WHETSTONE_HIER_RULE") else { return };
+    let parts: Vec<i32> = v.split(',').filter_map(|s| s.trim().parse().ok()).collect();
+    if parts.len() == 3 {
+        hier_set_rule(parts[0], parts[1], parts[2]);
+    } else {
+        eprintln!("WHETSTONE_HIER_RULE={v:?} ignored: expected three integers 0..3");
+    }
+}
+
+/// The rule currently in force.
+pub fn hier_get_rule() -> [i32; 3] {
+    let mut out = [0i32; 3];
+    // SAFETY: writes exactly three ints into a live stack array.
+    unsafe { ffi::wst_gemv_hier_get_rule(out.as_mut_ptr()) }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

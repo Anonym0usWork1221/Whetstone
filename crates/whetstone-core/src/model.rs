@@ -22,6 +22,7 @@
 use std::path::Path;
 
 use whetstone_kernels::{gemv, DeviceBuffer, DeviceCursor, QuantLinear};
+use whetstone_kernels::gemv::QuantLinearHier;
 use whetstone_quant::format::{self, Header, TensorEntry, TensorKind};
 
 use crate::error::{Error, Result};
@@ -29,8 +30,14 @@ use crate::ModelConfig;
 
 /// A linear layer resident on the device, in whatever precision it was stored.
 pub enum DeviceLinear {
-    /// int4 group-128, the format Whetstone targets.
+    /// int4 group-128 with an fp16 scale and zero per group. The 0.3.0 format.
     Int4(QuantLinear),
+    /// int4 group-32 with 4-bit scale/min indices against one fp16 pair per row.
+    ///
+    /// The current default: it costs 0.036 bits/weight more than `Int4` and
+    /// measured 1.15 perplexity better on Qwen2.5-0.5B, because group size turned
+    /// out to be worth six times what the fitting algorithm is worth.
+    Int4Hier(QuantLinearHier),
     /// Dense fp16. Used for anything whose input width is not a multiple of 128
     /// and for `lm_head` when the converter was told to keep it exact.
     Fp16 {
@@ -48,6 +55,7 @@ impl DeviceLinear {
     pub fn in_features(&self) -> usize {
         match self {
             Self::Int4(q) => q.in_features(),
+            Self::Int4Hier(q) => q.in_features(),
             Self::Fp16 { in_features, .. } => *in_features,
         }
     }
@@ -56,6 +64,7 @@ impl DeviceLinear {
     pub fn out_features(&self) -> usize {
         match self {
             Self::Int4(q) => q.out_features(),
+            Self::Int4Hier(q) => q.out_features(),
             Self::Fp16 { out_features, .. } => *out_features,
         }
     }
@@ -64,6 +73,7 @@ impl DeviceLinear {
     pub fn bytes(&self) -> usize {
         match self {
             Self::Int4(q) => q.bytes(),
+            Self::Int4Hier(q) => q.bytes(),
             Self::Fp16 { w, .. } => w.bytes(),
         }
     }
@@ -82,6 +92,7 @@ impl DeviceLinear {
     ) -> Result<()> {
         match self {
             Self::Int4(q) => q.gemv_ex(x, bias, y, accumulate)?,
+            Self::Int4Hier(q) => q.gemv_ex(x, bias, y, accumulate)?,
             Self::Fp16 { w, in_features, out_features } => {
                 gemv::gemv_fp16_ex(w, x, bias, y, *in_features, *out_features, accumulate)?
             }
@@ -104,6 +115,8 @@ pub enum Embedding {
     },
     /// int4-g128 table. Quantizing the head quantizes the input embedding too.
     Int4(QuantLinear),
+    /// int4 hierarchical-scale table.
+    Int4Hier(QuantLinearHier),
 }
 
 impl Embedding {
@@ -112,6 +125,7 @@ impl Embedding {
         match self {
             Self::Fp16 { vocab, .. } => *vocab,
             Self::Int4(q) => q.out_features(),
+            Self::Int4Hier(q) => q.out_features(),
         }
     }
 
@@ -120,6 +134,7 @@ impl Embedding {
         match self {
             Self::Fp16 { hidden, .. } => *hidden,
             Self::Int4(q) => q.in_features(),
+            Self::Int4Hier(q) => q.in_features(),
         }
     }
 
@@ -128,6 +143,7 @@ impl Embedding {
         match self {
             Self::Fp16 { w, .. } => w.bytes(),
             Self::Int4(q) => q.bytes(),
+            Self::Int4Hier(q) => q.bytes(),
         }
     }
 
@@ -139,6 +155,7 @@ impl Embedding {
         match self {
             Self::Fp16 { w, .. } => whetstone_kernels::embed_fp16(w, token, out)?,
             Self::Int4(q) => q.gather_row(token, out)?,
+            Self::Int4Hier(q) => q.gather_row(token, out)?,
         }
         Ok(())
     }
@@ -150,6 +167,7 @@ impl Embedding {
                 gemv::gemv_fp16_ex(w, x, None, logits, *hidden, *vocab, false)?
             }
             Self::Int4(q) => q.gemv_ex(x, None, logits, false)?,
+            Self::Int4Hier(q) => q.gemv_ex(x, None, logits, false)?,
         }
         Ok(())
     }
@@ -291,11 +309,14 @@ impl ModelWeights {
             });
         }
 
+        whetstone_kernels::gemv::hier_rule_from_env();
+
         let final_norm = load_fp16(&header, bytes, "model.norm.weight")?;
 
         let embed_entry = tensor(&header, "model.embed_tokens.weight")?;
         let embed = match embed_entry.kind {
             TensorKind::Int4G128 => Embedding::Int4(load_int4(bytes, embed_entry)?),
+            TensorKind::Int4HierG32 => Embedding::Int4Hier(load_int4_hier(bytes, embed_entry)?),
             _ => {
                 let (vocab, hidden) = shape2(embed_entry)?;
                 Embedding::Fp16 {
@@ -436,11 +457,20 @@ fn load_int4(bytes: &[u8], t: &TensorEntry) -> Result<QuantLinear> {
     Ok(QuantLinear::from_packed(&qw, &sz, in_f, out_f)?)
 }
 
+fn load_int4_hier(bytes: &[u8], t: &TensorEntry) -> Result<QuantLinearHier> {
+    let (out_f, in_f) = shape2(t)?;
+    let qw = as_u32(blob_bytes(bytes, t, "qw")?);
+    let si = blob_bytes(bytes, t, "si")?.to_vec();
+    let sb = as_u32(blob_bytes(bytes, t, "sb")?);
+    Ok(QuantLinearHier::from_packed(&qw, &si, &sb, in_f, out_f)?)
+}
+
 fn load_linear(h: &Header, bytes: &[u8], name: &str) -> Result<DeviceLinear> {
     let t = tensor(h, name)?;
     let (out_f, in_f) = shape2(t)?;
     match t.kind {
         TensorKind::Int4G128 => Ok(DeviceLinear::Int4(load_int4(bytes, t)?)),
+        TensorKind::Int4HierG32 => Ok(DeviceLinear::Int4Hier(load_int4_hier(bytes, t)?)),
         TensorKind::Fp16 => {
             let w = as_u16(blob_bytes(bytes, t, "data")?);
             if w.len() != in_f * out_f {
@@ -526,6 +556,23 @@ fn fuse_linears(h: &Header, bytes: &[u8], names: &[String]) -> Result<DeviceLine
                 sz.extend_from_slice(&as_u32(blob_bytes(bytes, e, "sz")?));
             }
             Ok(DeviceLinear::Int4(QuantLinear::from_packed(&qw, &sz, in_f, total_out)?))
+        }
+        TensorKind::Int4HierG32 => {
+            // Concatenating along the output dimension is a plain row append in
+            // this layout too: `qw` and `si` are row-major with a fixed stride
+            // and `sb` is one entry per row, so fusing needs no repacking and no
+            // re-conversion of existing files.
+            let mut qw = Vec::with_capacity(total_out * in_f / 8);
+            let mut si = Vec::with_capacity(total_out * in_f / whetstone_kernels::gemv::HGROUP);
+            let mut sb = Vec::with_capacity(total_out);
+            for e in &entries {
+                qw.extend_from_slice(&as_u32(blob_bytes(bytes, e, "qw")?));
+                si.extend_from_slice(blob_bytes(bytes, e, "si")?);
+                sb.extend_from_slice(&as_u32(blob_bytes(bytes, e, "sb")?));
+            }
+            Ok(DeviceLinear::Int4Hier(QuantLinearHier::from_packed(
+                &qw, &si, &sb, in_f, total_out,
+            )?))
         }
         TensorKind::Fp16 => {
             let mut w = Vec::with_capacity(total_out * in_f);

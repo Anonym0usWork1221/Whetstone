@@ -64,6 +64,16 @@ pub enum TensorKind {
     /// Two blobs: `qw` (`u32`, eight nibbles each) and `sz` (`u32`, an fp16
     /// scale in the low half and an fp16 zero in the high half).
     Int4G128,
+    /// int4 with hierarchical scales, groups of 32 along the input dimension.
+    ///
+    /// Three blobs: `qw` (`u32`, eight nibbles each), `si` (`u8`, a 4-bit scale
+    /// index low and a 4-bit min index high) and `sb` (`u32`, an fp16 `d` low
+    /// and an fp16 `dmin` high, one per row).
+    ///
+    /// `scale = d*ls`, `min = -dmin*lm`, `w = q*scale + min`. Group 32 at
+    /// `4 + 8/32 + 32/in_features` bits against `Int4G128`'s flat 4.25 — see
+    /// `hier.rs` for the perplexity table that justifies the swap.
+    Int4HierG32,
 }
 
 impl TensorKind {
@@ -73,6 +83,10 @@ impl TensorKind {
             Self::Fp16 => 16.0,
             Self::Fp32 => 32.0,
             Self::Int4G128 => 4.0 + 32.0 / 128.0,
+            // Depends on the row length, which this method does not have. The
+            // roofline never uses it -- `decode_resident_bytes` sums the blobs
+            // that were actually written -- so this is only a display default.
+            Self::Int4HierG32 => 4.0 + 8.0 / 32.0 + 32.0 / 896.0,
         }
     }
 }
@@ -183,10 +197,18 @@ impl Header {
     }
 }
 
-/// FNV-1a, 64-bit.
+/// FNV-1a-shaped, 64-bit. **The multiplier is not the FNV-1a prime.**
 ///
-/// Not cryptographic — the threat model is a truncated download or a bad disk,
-/// not an adversary. It is one pass with no table and no dependency.
+/// `0x1000_0000_01b3` is one hex digit longer than the real prime,
+/// `0x100000001b3`. That was a typo, and it survived because the only thing that
+/// ever checked this hash was the implementation that produced it — a
+/// reimplementation of the container in Python is what surfaced it.
+///
+/// **Do not correct it.** The threat model is a truncated download or a bad
+/// disk, not an adversary, and any odd multiplier detects that equally well;
+/// changing the constant would invalidate every `.wstone` already written in
+/// exchange for nothing. It is documented here so that the next person to spot
+/// it does not have to rediscover why it stays.
 pub fn fnv1a(bytes: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for &b in bytes {
@@ -273,6 +295,26 @@ impl<W: Write + Seek> Writer<W> {
         self.entries.push(TensorEntry {
             name: name.into(),
             kind: TensorKind::Int4G128,
+            shape: vec![packed.out_features, packed.in_features],
+            blobs,
+        });
+        Ok(())
+    }
+
+    /// Appends an int4 hierarchical-scale tensor.
+    pub fn write_int4_hier(&mut self, name: &str, packed: &crate::PackedInt4Hier) -> Result<()> {
+        let qw = self.write_blob(bytemuck_cast(&packed.qw))?;
+        let si = self.write_blob(&packed.si)?;
+        let sb = self.write_blob(bytemuck_cast(&packed.sb))?;
+
+        let mut blobs = BTreeMap::new();
+        blobs.insert("qw".into(), qw);
+        blobs.insert("si".into(), si);
+        blobs.insert("sb".into(), sb);
+
+        self.entries.push(TensorEntry {
+            name: name.into(),
+            kind: TensorKind::Int4HierG32,
             shape: vec![packed.out_features, packed.in_features],
             blobs,
         });
@@ -441,6 +483,7 @@ pub fn read_header(bytes: &[u8], file_len: u64) -> Result<Header> {
         }
         let expect_blobs: &[&str] = match t.kind {
             TensorKind::Int4G128 => &["qw", "sz"],
+            TensorKind::Int4HierG32 => &["qw", "si", "sb"],
             TensorKind::Fp16 | TensorKind::Fp32 => &["data"],
         };
         for want in expect_blobs {

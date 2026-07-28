@@ -6,7 +6,10 @@ use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
 use whetstone_core::{ModelConfig, SafeTensors};
-use whetstone_quant::{format, quantize_int4_g128, relative_error, PackedInt4};
+use whetstone_quant::{
+    format, quantize_int4_g128, quantize_int4_hier, relative_error, PackedInt4,
+    PackedInt4Hier,
+};
 
 /// Precision for the transformer-block projections.
 ///
@@ -15,7 +18,16 @@ use whetstone_quant::{format, quantize_int4_g128, relative_error, PackedInt4};
 /// lossy", and those two failures look identical from a perplexity number.
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum BodyPrecision {
-    /// int4 group-128. The production format.
+    /// int4 group-32 with hierarchical scales. The production format.
+    ///
+    /// 4 + 8/32 + 32/in_features bits/weight — 0.036 more than `Int4` — for
+    /// 1.15 less perplexity on Qwen2.5-0.5B. Group size turned out to be worth
+    /// six times what the fitting algorithm is worth, and this is how to afford
+    /// it: the per-group metadata is two 4-bit indices against one fp16 pair per
+    /// row, instead of an fp16 scale and an fp16 zero per group.
+    Int4Hier,
+    /// int4 group-128 with an fp16 scale and zero per group. The 0.3.0 format,
+    /// kept so an A/B against it is one flag.
     Int4,
     /// Dense fp16. 988 MB for Qwen2.5-0.5B, and the differential-testing baseline.
     Fp16,
@@ -26,6 +38,8 @@ pub enum BodyPrecision {
 pub enum HeadPrecision {
     /// Keep `lm_head` in fp16. Safe default.
     Fp16,
+    /// Quantize `lm_head` to int4 with hierarchical scales.
+    Int4Hier,
     /// Quantize `lm_head` to int4-g128. Largest single bandwidth win available,
     /// and the riskiest — it sets the output distribution directly.
     Int4,
@@ -80,18 +94,32 @@ pub fn run(
     w.set_quant_meta(
         "scheme",
         match body {
+            BodyPrecision::Int4Hier => "int4-hier-g32",
             BodyPrecision::Int4 => "int4-g128-asymmetric",
             BodyPrecision::Fp16 => "fp16",
         },
     );
-    w.set_quant_meta("group", "128");
-    w.set_quant_meta("method", "rtn");
+    w.set_quant_meta(
+        "group",
+        match body {
+            BodyPrecision::Int4Hier => "32",
+            _ => "128",
+        },
+    );
+    w.set_quant_meta(
+        "method",
+        match body {
+            BodyPrecision::Int4Hier => "kqx2-weighted-ls",
+            _ => "rtn",
+        },
+    );
     w.set_quant_meta("source", &weights.display().to_string());
     w.set_quant_meta(
         "lm_head",
         match head {
             HeadPrecision::Fp16 => "fp16",
             HeadPrecision::Int4 => "int4-g128",
+            HeadPrecision::Int4Hier => "int4-hier-g32",
         },
     );
 
@@ -113,6 +141,25 @@ pub fn run(
             if body == BodyPrecision::Fp16 {
                 write_fp16(&mut w, &name, &w32, &[out_f, in_f])?;
                 n_dense += 1;
+                continue;
+            }
+
+            if body == BodyPrecision::Int4Hier {
+                if in_f % whetstone_quant::HGROUP != 0 {
+                    println!("  {name}: in_features {in_f} not a multiple of 32, keeping fp16");
+                    write_fp16(&mut w, &name, &w32, &[out_f, in_f])?;
+                    n_dense += 1;
+                    continue;
+                }
+                let packed = quantize_int4_hier(&w32, in_f, out_f)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                let e = report_error_hier(&w32, &packed);
+                err_sum += e;
+                if e > worst.0 {
+                    worst = (e, name.clone());
+                }
+                w.write_int4_hier(&name, &packed).map_err(|e| anyhow::anyhow!("{e}"))?;
+                n_quant += 1;
                 continue;
             }
 
@@ -170,6 +217,14 @@ pub fn run(
     let embed32 = st.to_f32(EMBED)?;
 
     match head {
+        HeadPrecision::Int4Hier if hidden % whetstone_quant::HGROUP == 0 => {
+            let packed = quantize_int4_hier(&embed32, hidden, vocab)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let e = report_error_hier(&embed32, &packed);
+            println!("  lm_head quantized to int4-hier-g32, relative error {e:.4}");
+            w.write_int4_hier(EMBED, &packed).map_err(|e| anyhow::anyhow!("{e}"))?;
+            n_quant += 1;
+        }
         HeadPrecision::Int4 if hidden % whetstone_quant::GROUP == 0 => {
             let packed = quantize_int4_g128(&embed32, hidden, vocab)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -255,6 +310,11 @@ pub fn run(
 
 fn report_error(w32: &[f32], packed: &PackedInt4) -> f64 {
     let deq = whetstone_quant::dequantize_int4_g128(packed);
+    relative_error(w32, &deq)
+}
+
+fn report_error_hier(w32: &[f32], packed: &PackedInt4Hier) -> f64 {
+    let deq = whetstone_quant::dequantize_int4_hier(packed);
     relative_error(w32, &deq)
 }
 

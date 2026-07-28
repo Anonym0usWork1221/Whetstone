@@ -267,6 +267,31 @@ extern "C" {
         rows: i32,
     ) -> i32;
 
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn wst_gemv_int4_hier_ex(
+        qw: *const c_void,
+        si: *const c_void,
+        sb: *const c_void,
+        x: *const c_void,
+        bias: *const c_void,
+        y: *mut c_void,
+        in_f: i32,
+        out_f: i32,
+        accum: i32,
+    ) -> i32;
+    pub(crate) fn wst_gemv_hier_set_rule(wide: i32, huge: i32, other: i32);
+    pub(crate) fn wst_gemv_hier_get_rule(out: *mut i32);
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn wst_embed_int4_hier(
+        qw: *const c_void,
+        si: *const c_void,
+        sb: *const c_void,
+        row: *const c_void,
+        out: *mut c_void,
+        in_f: i32,
+        vocab: i32,
+    ) -> i32;
+
     pub(crate) fn wst_graph_capture_begin() -> i32;
     pub(crate) fn wst_graph_capture_end(out_exec: *mut *mut c_void) -> i32;
     pub(crate) fn wst_graph_launch(exec: *mut c_void) -> i32;

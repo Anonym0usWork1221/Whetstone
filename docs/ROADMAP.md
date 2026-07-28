@@ -13,28 +13,32 @@ it with no Python and no framework in the token loop.
 
 Measured on the reference GPU, same model, `llama-bench`:
 
-| engine | format | bits/wt | bytes/token | decode (tg384) | Δ ppl vs own fp16 |
+| engine | format | bits/wt | bytes/token | decode (tg384) | Δ ppl vs fp16 |
 |---|---|---|---|---|---|
 | HuggingFace | fp16 | 16.00 | 988 MB | 40.3 | *(anchor)* |
-| **llama.cpp** | **Q4_K_M** | 6.35 | 392 MB | **281.9** | **+0.3253** |
-| **Whetstone** | **int4 `.wstone`** | 4.25 | **262 MB** | **423.9** | **+4.2106** |
+| **llama.cpp** | **Q4_K_M** | 6.35 | 392 MB | **283.8** | **+0.3957** |
+| Whetstone 0.3.0 | int4-g128 | 4.25 | 262 MB | 434.1 | +4.2078 |
+| **Whetstone 0.4.0** | **int4-hier-g32** | 4.28 | **264 MB** | **415.2** | **+2.2011** |
+| **+ GPTQ (opt-in)** | int4-hier-g32 | 4.28 | 264 MB | 414.0 | **+0.8174** |
 
-llama.cpp is the real competitor, not HuggingFace, and the comparison splits
-cleanly in two:
+llama.cpp is the real competitor, not HuggingFace:
 
-- **Speed: won.** 1.50×, from reading 1.49× fewer bytes per token. The roofline
-  said the ratios would track, and they do.
-- **Quality: lost, by a lot.** Q4_K_M costs +0.33 perplexity against its own
-  fp16; int4-g128 round-to-nearest costs +4.21. Not a bit-budget excuse —
-  k-quants keep the embedding and output wide, so Q4_K_M is really 6.35
-  bits/weight, and Whetstone's 7.49-bit variant *still* costs +2.75.
+- **Speed: 1.46×**, from reading 1.49× fewer bytes per token. The roofline said
+  the ratios would track, and they do.
+- **Quality: 2.1× its damage**, down from 10.6× in 0.3.0.
 
-Every stage below is judged against llama.cpp on **both** axes. Stage 5 is now
-the only one that matters.
+Every stage below is judged against llama.cpp on **both** axes.
 
-*(Absolute perplexity is not comparable across the two harnesses — the same fp16
-weights read 13.8182 here and 12.2484 under `llama-perplexity`. Only the
-same-harness delta is. `bench/compare.py` measures fp16 in both for this reason.)*
+*(Q4_K_M's row is llama.cpp's own weights dequantized with its own `gguf-py` and
+measured in **this** harness. Quoting `llama-perplexity` instead is not valid: it
+scores only the second half of each window, worth 1.57 perplexity on this corpus.
+Two earlier versions of this file treated that offset as a tokenization
+difference.)*
+
+*(And Q4_K_M is not a 4-bit format on this model. `hidden = 896` is not a
+multiple of `QK_K = 256`, so every projection except `down_proj` falls back to
+`Q5_0` at 5.50 bpw and the tied head to `Q8_0` at 8.50 — body **5.53**, against
+Whetstone's 4.25.)*
 
 Status keys: **done** · *in progress* · planned
 
@@ -57,7 +61,7 @@ it is checked against an independent implementation.
 
 - **done** int4 group-128 asymmetric quantizer and packer
 - **done** `.wstone` container: aligned, checksummed, self-describing
-- **done** `whetstone convert` — 988 MB → 263.6 MB, mean relative error 0.110
+- **done** `whetstone convert` — 988 MB → 272.5 MB at 4.28 bits/weight
 - **done** `whetstone verify` — integrity and fidelity
 - **done** int4 decode GEMV kernel, differential-tested against its dequantized
   reference, 1.50× fp16 wall-clock
@@ -118,34 +122,57 @@ models. Qwen2.5-0.5B has 24 layers and much less redundancy.
 - planned Drop the flattest layers, measure perplexity and top-1 agreement
 - planned Healing finetune, if the un-healed degradation is close but not close enough
 
-## Stage 5 — Beyond int4  *next, and now the top of the list*
+## Stage 5 — A quantizer that competes  **done**
 
-Stages 3 and 4 are done and were lossless. This is where the accuracy budget
-gets spent, and the measurements say it is already overspent:
+This is where the accuracy budget gets spent, and in 0.3.0 it was overspent by
+5×. At a fixed ~4.25 bits on the transformer body:
 
-| what is quantized | bits/wt | wikitext-2 ppl | Δ |
-|---|---|---|---|
-| nothing | 16.00 | 13.8209 | — |
-| transformer blocks | 7.49 | 16.5696 | **+2.75** |
-| blocks + `lm_head` | 4.25 | 18.0287 | **+4.21** |
+| quantizer | bits/wt | Δ ppl |
+|---|---|---|
+| round-to-nearest, group 128 *(0.3.0)* | 4.250 | +2.730 |
+| llama.cpp's complete k-quant fitted scale/min search | 4.250 | +2.575 |
+| **group 32, hierarchical scale metadata** *(0.4.0)* | **4.277** | **+1.575** |
+| **+ GPTQ at 131k calibration tokens** | 4.277 | **+0.668** |
 
-int4-g128 round-to-nearest is not free, and the earlier "100% top-1 agreement"
-finding was measured on three prompts — enough to miss a 2.75-perplexity
-regression entirely, because the argmax stays stable long after the distribution
-has moved. **Recovering that 4.2 is now worth more than another 1.5× of speed.**
+- **done** `Int4HierG32`: group 32 with two 4-bit indices per group against one
+  `f16` pair per row. Group size is worth ~6× what the fitting algorithm is
+  worth, and this is how to afford it — 0.036 bits/weight for a factor of four
+  in granularity.
+- **done** GPTQ at adequate calibration. The 0.3.0 sweep used **293** tokens
+  against 896- and 4864-dimensional Hessians; at 131,072 it is the single
+  largest lever in the project (−1.73 at group 128).
+- **done** AWQ activation-aware scaling, with all four fusion points including
+  the GQA-constrained `o_proj → v_proj` one. **Not shipped**: worth 0.88 alone
+  but only 0.06 on top of GPTQ, since both read the same activation statistics.
+- **done** `--head int4-hier` as an opt-in switch. Cost measured at **+0.52** ppl
+  for 1.76× fewer bytes, against +1.10 in the 0.3.0 format.
 
-- planned GPTQ with adequate calibration (~262k tokens; the earlier sweep used
-  293, leaving every Hessian rank-deficient and the result inconclusive)
-- **done** `--head int4` as an opt-in switch. Its cost is now measured: +1.46 ppl
-  for 1.76× fewer bytes.
-- planned fp16 top-k re-score so the argmax stays exact under a quantized head
-- planned GPTQ with adequate calibration (~262k tokens; the current sweep used
-  293, leaving every Hessian rank-deficient and the result inconclusive)
-- planned AWQ activation-aware scaling
-- planned Hadamard/rotation preprocessing, to test whether int3 becomes viable
+**The caveat on the GPTQ row.** It is calibrated on held-out wikitext and
+evaluated on wikitext. Recalibrated on 131k tokens of C/C++ source it reads
+**+2.27 — worse than not running it at all.** The inverse Hessian is a claim
+about which input directions matter, and code and Wikipedia disagree. `convert`
+therefore ships the data-free format; GPTQ is an opt-in offline step.
+
+## Stage 5b — What is left in the quantizer  *next*
+
+- planned **fp16 top-k re-score under a quantized head.** Measured in the
+  research harness: k=64 removes **82%** of the head's remaining cost for
+  `64·896·2` = 114 KB/token — **0.17% more bandwidth** — plus 272 MB of VRAM,
+  which a 6 GB card holding a 264 MB model is not short of. Needs a top-k
+  reduction and a gathered 64×896 GEMV; neither touches the main decode path.
+- planned Sensitivity-aware bit allocation. `v_proj` is the worst tensor in
+  every one of the 24 layers and is 0.93% of parameters; llama.cpp bumps exactly
+  this tensor and gates the rule on `n_gqa >= 4`, and this model is 7.
+- planned Sequential GPTQ — propagate quantized activations layer by layer
+  rather than taking every Hessian from the fp16 model.
+- planned Calibration on a broad corpus (C4) rather than in-domain wikitext,
+  which is what the literature does and what the domain-shift result above says
+  is the honest configuration.
+- planned int3 with hierarchical scales **and** GPTQ. int3-g128 round-to-nearest
+  measured +29 and was written off; the two techniques are jointly worth 2.06 at
+  4 bits and int3 has never been measured with them.
+- planned Hadamard/rotation preprocessing
 - planned int8 KV cache
-- planned Sensitivity-aware bit allocation (`v_proj` is consistently the worst
-  tensor to quantize — measured across all 24 layers)
 
 ## Stage 6 — Speculative decoding  planned
 
@@ -181,6 +208,7 @@ rejected for a stated reason. The full analysis is in the research notes.
 | Marlin, FlashAttention-2, BitBLAS kernels | All architected around `cp.async`, which is sm_80+. Turing has no equivalent. |
 | 2:4 structured sparsity | No hardware support on sm_75, and it saves no bytes at low bit widths. |
 | Weight offloading | The model is 264 MB against 6 GB of VRAM. There is nothing to offload. |
+| Optimising weight relative error | Measured twice, in both directions: a clip search that *lowers* it raises perplexity by 0.50, and GPTQ *raises* it while lowering perplexity by 1.73. Weight error and output error are different objectives. |
 | Fitting large-model knowledge into a small model | Language models store ~2 bits of knowledge per parameter ([Allen-Zhu & Li, ICLR 2025](https://arxiv.org/abs/2404.05405)). A 0.5B model caps near 1 Gbit; a 1T model holds ~2 Tbit. That ~2,000× gap is an information-capacity limit, not an efficiency one — no quantizer or kernel closes it. The achievable versions are retrieval, task-specific distillation, and speculative decoding (which is provably lossless). |
 | Post-training sub-2-bit on this model | A *training* problem, not a kernel problem. The one credible route, BitDistill (arXiv 2510.13998), needs 10B tokens of continual pre-training plus distillation — infeasible on one 6 GB card. |
 

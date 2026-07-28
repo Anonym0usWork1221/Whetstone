@@ -12,11 +12,11 @@ then measures, at every step, whether that actually made anything faster.
 - **Reference GPU:** NVIDIA RTX 2060 — `sm_75` Turing, 30 SMs, 6 GB, 336 GB/s
 - **Stack:** CUDA C++ kernels, Rust engine, Python for evaluation
 
-> **Status: the executor works and is 1.50× llama.cpp Q4_K_M on the reference
-> GPU — but the quantizer is 13× worse.** 423.9 tok/s against 281.9, and +4.21
-> perplexity against Q4_K_M's +0.33. The speed is real; the format that buys it
-> is not competitive yet. Both numbers are below, together, because either one
-> alone is misleading.
+> **Status (0.4.0): 1.46× llama.cpp Q4_K_M on the reference GPU, at 2.1× its
+> quantization damage.** 414.0 tok/s against 283.8, and +0.82 perplexity against
+> Q4_K_M's +0.40 — measured in one harness, on llama.cpp's own weights, so the
+> two deltas are the same measurement. 0.3.0 was 1.53× at **10.6×** the damage;
+> the difference is a new weight format that costs 0.03 bits/weight.
 >
 > Prefill still runs the decode path one token at a time, which is the honest
 > starting point and not what a fast engine does. See
@@ -62,6 +62,7 @@ At the **measured** 278 GB/s:
 |---|---|---|---|
 | fp16 | 16.00 | 987.9 MB | 281 |
 | int8 per-channel | 8.00 | 494.0 MB | 563 |
+| **int4 hier-g32** *(current)* | **4.28** | **264.4 MB** | **1051** |
 | int4 g128 | 4.25 | 262.4 MB | 1060 |
 | int3 g128 | 3.25 | 200.7 MB | 1385 |
 | int2 g128 | 2.25 | 138.9 MB | 2001 |
@@ -91,8 +92,7 @@ So the ranked opportunity is the opposite of where this project started:
 
 1. **Remove framework overhead** — up to ~9×, and **costs zero accuracy**
 2. **Quantize `lm_head`** — one matrix, 27.6% of all decode traffic
-3. **Shrink the block weights** to int4 — the remaining 72.4%, at KL 0.19 and
-   100% top-1 agreement
+3. **Shrink the block weights** to int4 — the remaining 72.4%
 4. **Exotic arithmetic** — worth approximately nothing at batch=1 decode
 
 The lossless win is both larger and safer than the lossy one.
@@ -164,20 +164,57 @@ unquantized model:
 For scale: the model's own output entropy on these prompts is 1.3–3.1 nats. A KL
 of 10+ means the distribution has no meaningful relationship to the original.
 
+> **That "100% top-1 agreement" for int4-g128 is exactly the trap this table
+> sets.** It was measured on three prompts at one position each. Over 40,940
+> predictions the same format costs **+2.73 perplexity** — a fifth of the
+> model's quality. The argmax stays put long after the distribution has moved.
+> Both columns above are kept because the *ordering* is informative and the
+> ternary result is decisive, but neither is a quality gate. Use
+> `whetstone ppl`.
+
 **Round-to-nearest ternary destroys this model.** That is not a contradiction of
 the BitNet results — BitNet *trains* in ternary with a straight-through
 estimator, so its weights are built to be representable on that grid. Weights
 trained in bf16 were never constrained that way, and a 0.5B model has far less
 redundancy to spend than a 7B one.
 
-The open question is therefore not "how few bits" but "how much of that gap a
-better quantizer recovers". A GPTQ pass improves int4 (KL 0.187 → 0.171, with
-*higher* weight error — the expected signature of trading weight fidelity for
-output fidelity), but the sub-4-bit runs are **not yet a fair test**: the
-calibration set was 293 tokens, so `H = 2XᵀX` has rank ≤ 293 against dimensions
-of 896 and 4864. Every Hessian was rank-deficient and dominated by damping. That
-experiment needs re-running with ~262k calibration tokens before any conclusion
-about sub-4-bit is drawn.
+The open question is therefore not "how few bits" but **how much of that gap a
+better quantizer recovers — and the answer turned out to be most of it.** At a
+fixed 4 bits, on the transformer body, perplexity delta against fp16:
+
+| quantizer, all at ~4.25–4.28 bits/weight | Δ ppl |
+|---|---|
+| round-to-nearest, group 128 *(0.3.0)* | +2.730 |
+| llama.cpp's complete k-quant fitted scale/min search | +2.575 |
+| **group 32 with hierarchical scale metadata** *(0.4.0)* | **+1.575** |
+| **the same, plus GPTQ at 131k calibration tokens** | **+0.668** |
+
+Two things did that, and neither is the one you would guess:
+
+**Group size, not the fitting algorithm.** Halving the group buys 0.96
+perplexity; replacing round-to-nearest with the full k-quant alternating
+least-squares fit buys 0.16. Group 32 was previously unaffordable because an
+`f16` scale plus an `f16` zero per 32 weights is 1.0 bits/weight of metadata
+against group 128's 0.25 — so 0.4.0 stores two 4-bit *indices* per group against
+one `f16` pair per row instead, and gets group 32 for **0.03** bits/weight.
+
+**Weight error is the wrong objective.** A one-parameter clip search that
+provably *lowers* mean weight error from 0.1102 to 0.1067 *raises* perplexity by
+0.50. GPTQ does the opposite — it *raises* weight error to 0.1416 and lowers
+perplexity by 1.73. Anything that minimises `‖W − Ŵ‖` without reference to what
+multiplies `W` is, at this model size, as likely to hurt as help.
+
+The earlier GPTQ result here was recorded as inconclusive. It was never a test:
+the calibration set was **293 tokens** against Hessians of dimension 896 and
+4864, so every `H = 2XᵀX` was rank-deficient and dominated by its damping term.
+At 131,072 tokens it is the single largest lever in the project.
+
+> **GPTQ's gain is substantially in-domain.** Calibrated on held-out wikitext
+> and evaluated on wikitext it is worth −0.91. Calibrated on 131k tokens of
+> C/C++ source and evaluated on wikitext it reads **+2.27 — worse than not
+> running it at all**. The inverse Hessian is a claim about which input
+> directions matter, and code and Wikipedia disagree about that. So `convert`
+> ships the data-free format and GPTQ stays an opt-in offline step.
 
 ---
 
@@ -192,7 +229,8 @@ Essentially the whole current pipeline is a reimplementation of solved problems:
 
 | in this repo | who did it first, and better |
 |---|---|
-| int4 group-128 asymmetric quantization | **GPTQ** (2022), AWQ, GGUF `Q4_0`/`Q4_K`. This is the standard format, unchanged. |
+| int4 group quantization with hierarchical scales | **GGUF `Q4_K`** does exactly this — 6-bit sub-scales against a super-block `f16` pair. Whetstone's variant differs in the block geometry (a whole row, 4-bit indices, group 32) because `hidden = 896` is not a multiple of `QK_K`, not because the idea is new. |
+| GPTQ error compensation | **GPTQ** (2022). Reimplemented, not invented. |
 | the `.wstone` container | **GGUF** — self-describing, mmap-able, aligned, embedded config, and an actual ecosystem. `.wstone` is a GGUF with fewer features and no users. |
 | int4 decode GEMV kernel | **llama.cpp** `mul_mat_vec_q`, **exllamav2**, AWQ kernels — all faster and battle-tested. |
 | HF → quantized converter | `convert_hf_to_gguf.py` + `llama-quantize`, AutoGPTQ, AutoAWQ, optimum. |
@@ -248,51 +286,56 @@ you a week.
 Not an estimate — llama.cpp built from source for `sm_75` and run on the same
 RTX 2060 with the same checkpoint (`llama-bench`, 3 repetitions):
 
-| engine / format | bits/wt | bytes/token | decode tok/s | ppl | Δ vs own fp16 |
+| engine / format | bits/wt | bytes/token | decode tok/s | ppl | Δ vs fp16 |
 |---|---|---|---|---|---|
 | HuggingFace fp16 | 16.00 | 988 MB | 40.3 | 13.8182 | *(anchor)* |
-| llama.cpp fp16 | 16.00 | 988 MB | 131.0 | 12.2484 | *(anchor)* |
-| **llama.cpp Q4_K_M** | 6.35 | 392 MB | **281.9** | 12.5737 | **+0.3253** |
+| **llama.cpp Q4_K_M** | 6.35 | 392 MB | **283.8** | 14.2138 | **+0.3957** |
 | Whetstone fp16 | 16.00 | 988 MB | 211.6 | 13.8209 | +0.0028 |
-| Whetstone int4 body | 7.49 | 462 MB | 331.2 | 16.5712 | +2.7530 |
-| **Whetstone int4** | 4.25 | 262 MB | **423.9** | 18.0287 | **+4.2106** |
+| Whetstone int4-g128 *(0.3.0)* | 4.25 | 262 MB | **434.1** | 18.0287 | +4.2078 |
+| Whetstone int4-hier-g32 | 4.28 | 264 MB | 415.2 | 16.0220 | +2.2011 |
+| **Whetstone int4-hier-g32 + GPTQ** | 4.28 | 264 MB | **414.0** | 14.6383 | **+0.8174** |
 
 Engines are **interleaved** — one sample of each, round-robin — because measuring
 all of A then all of B compares A cold to B hot. An earlier run of this harness
 did exactly that and read llama.cpp at 250.8 instead of 281.9, inflating the
 speed ratio from 1.50× to 1.69×.
 
-**Absolute perplexity is not comparable across the two harnesses** — the *same
-fp16 weights* score 13.8182 here and 12.2484 under `llama-perplexity`, a
-1.57-point offset from different tokenization and chunking. Only the last column
-is comparable.
+**Q4_K_M's perplexity is llama.cpp's own weights measured in this harness**, not
+a number quoted from `llama-perplexity`, so every row above is the same
+measurement. That matters more than it sounds: `llama-perplexity` scores only
+the **second half** of each window (`perplexity.cpp:542`,
+`const int first = n_ctx/2`), so every token it grades carries ≥1024 tokens of
+context. Matching that rule here makes the same fp16 weights read 12.2462
+against `llama-perplexity`'s 12.2484 — **the entire 1.57-point "harness offset"
+that earlier versions of this README attributed to tokenization is the scoring
+protocol.** `bench/gguf_ppl.py` in the research tree dequantizes a `.gguf` with
+llama.cpp's own `gguf-py` and runs it here, which removes the argument entirely.
 
-Two results, and they point in opposite directions:
+**Speed: 1.46× llama.cpp Q4_K_M**, from reading 1.49× fewer bytes per token. The
+speed ratio tracks the byte ratio, which is what the roofline says should happen.
 
-**The engine is 1.50× llama.cpp Q4_K_M** — 423.9 tok/s against 281.9, reading
-1.49× fewer bytes per token. The speed ratio tracks the byte ratio, which is
-what the roofline says should happen.
+**Quality: 2.1× its damage**, down from 10.6× in 0.3.0.
 
-**The quantizer is 13× worse.** Q4_K_M costs +0.33 perplexity against its own
-fp16; Whetstone's int4-g128 round-to-nearest costs +4.21. And that is not a
-bit-budget excuse: k-quants keep the embedding and output projection wide, so
-Q4_K_M is really **6.35** bits/weight, not four. Whetstone's 7.49-bit variant —
-*more* bits than Q4_K_M — still costs +2.75. The gap is the rounding, not the
-budget.
+And a correction to what this README used to claim. It said the gap was "the
+rounding, not the budget", on the grounds that Whetstone's 7.49-bit variant lost
+more than Q4_K_M at 6.35. That compared a total containing an *fp16* head
+against a total containing an *8.5-bit* head. Read per tensor out of the file:
+k-quants need the row length to be a multiple of `QK_K = 256`, and Qwen2.5-0.5B
+has `hidden = 896` — so **896 mod 256 = 128**, every projection except
+`down_proj` falls back to `Q5_0` at 5.50 bpw, and the tied head to `Q8_0` at
+8.50. Q4_K_M's body is **5.53** bits/weight against Whetstone's 4.25. It was
+substantially the budget.
 
-So the honest summary is: **a fast engine wrapped around a naive quantizer.**
-Round-to-nearest was never going to compete with k-quants, and the earlier
-"100% top-1 agreement" reading (three prompts) hid how far behind it is.
-Closing that — GPTQ at adequate calibration, AWQ-style scaling,
-sensitivity-aware bit allocation — is worth more than any remaining speed work,
-and is what [docs/ROADMAP.md](docs/ROADMAP.md) Stage 5 is now about.
+It was not *only* the budget, and the remaining part is what 0.4.0 closes. See
+[docs/ROADMAP.md](docs/ROADMAP.md).
 
 Whetstone's fp16 path is the control: **13.8209 against HuggingFace's 13.8182**
 on the same 40,940 predictions — a 0.02% difference. That is what says the
 engine is right and the perplexity gap is the quantizer, not a bug.
 
 *(An earlier version of this README projected "~445 tok/s, about 1.5×
-llama.cpp" from the roofline. Measured: 431.8 and 1.53×.)*
+llama.cpp" from the roofline. Measured: 434.1 and 1.53×, before 0.4.0 spent 4.6%
+of it on a better weight format.)*
 
 **Reproduce this yourself:**
 
@@ -317,9 +360,19 @@ about exotic arithmetic at all:
 
 That finding is the opposite of where this project started, and it came from
 measuring the baseline instead of assuming it was near-optimal. The comparison
-table above shows the humbling half of it: llama.cpp has already banked that 9x.
-The remaining edge is 1.49x fewer bytes per token, and it is unrealised until
-there is an executor.
+table above shows the humbling half of it: llama.cpp has already banked that 9×.
+The remaining edge is 1.49× fewer bytes per token, and as of 0.4.0 it is
+realised — at a quality cost that is now within about 2× of the competition
+rather than 10×.
+
+The second finding, from 0.4.0, is smaller but more transferable: **three
+different cheap proxies for quality have each been wrong here, in a way that
+would have changed what got built.** Top-1 agreement on a few prompts missed a
+2.73-perplexity regression. Weight relative error moves in the *opposite*
+direction to quality under two different techniques. And a perplexity delta
+borrowed from another engine's harness was off by 1.57 because that harness
+scores only half of each window. Each was caught by measuring the thing itself
+instead of the proxy, and each had already been used to make a decision.
 
 ---
 
@@ -354,7 +407,7 @@ whetstone inspect /path/to/Qwen2.5-0.5B-Instruct
 
 # Convert to Whetstone's own weight format
 whetstone convert /path/to/Qwen2.5-0.5B-Instruct -o qwen05b.wstone
-whetstone convert /path/to/Qwen2.5-0.5B-Instruct -o qwen05b.wstone --head int4
+whetstone convert /path/to/Qwen2.5-0.5B-Instruct -o qwen05b.wstone --head int4-hier
 
 # Check integrity, and fidelity against the source
 whetstone verify qwen05b.wstone --source /path/to/Qwen2.5-0.5B-Instruct
@@ -370,11 +423,15 @@ is an `mmap` and a pointer walk, not a decode.
 
 Measured on Qwen2.5-0.5B-Instruct:
 
-| variant | size | bits/weight | mean rel. error | decode ceiling |
-|---|---|---|---|---|
-| source (bf16) | 988.1 MB | 16.00 | — | 281 tok/s |
-| int4 body, fp16 head | 463.6 MB | 7.49 | 0.1102 | 601 tok/s |
-| **int4 everywhere** | **263.6 MB** | **4.25** | 0.1095 | **1059 tok/s** |
+| variant | size | bits/weight | Δ ppl | decode ceiling | measured |
+|---|---|---|---|---|---|
+| source (bf16) | 988.1 MB | 16.00 | — | 281 tok/s | 211.6 |
+| int4-hier body, fp16 head | 471.8 MB | 7.51 | +1.550 | 599 tok/s | — |
+| **int4-hier everywhere** | **272.5 MB** | **4.28** | **+2.201** | **1051 tok/s** | **415.2** |
+| **+ GPTQ (offline, opt-in)** | 272.5 MB | 4.28 | **+0.817** | 1051 tok/s | 414.0 |
+
+`--body int4` still selects the group-128 format from 0.3.0 (4.25 bpw, +4.208)
+so an A/B against it is one flag.
 
 Full specification in [docs/FORMAT.md](docs/FORMAT.md). The trade is
 portability: no other runtime can execute a `.wstone`, and it is not meant to.
@@ -413,7 +470,7 @@ The binary is a normal cargo artifact — `./target/release/whetstone`, or
 ```bash
 # Convert once, then execute with no Python in the token loop.
 # The tokenizer is embedded, so the .wstone needs no sidecar files.
-whetstone convert /path/to/Qwen2.5-0.5B-Instruct -o model.wstone --head int4
+whetstone convert /path/to/Qwen2.5-0.5B-Instruct -o model.wstone --head int4-hier
 
 # Interactive chat, throughput reported per turn
 whetstone chat model.wstone
@@ -448,7 +505,8 @@ As of 2021, the estimated population of Tokyo is around 11 million.
 Note the second turn prefills 17 tokens, not 43 — the first turn is still in the
 cache.
 
-`--temperature 0` is the fastest path at **467 tok/s**: greedy decode never
+`--temperature 0` is the fastest path at **476 tok/s** on a warm cache: greedy
+decode never
 leaves the GPU, because the argmax writes into the device cursor that the next
 step's embedding gather reads. Sampling runs at **369 tok/s** — it needs the
 distribution on the host, which is a 608 KB copy plus an O(vocab) selection per
@@ -521,9 +579,19 @@ No optimization is finished until it passes all of these. Speed without the gate
 is not a result.
 
 1. Kernel output matches an fp32 CPU reference within a stated tolerance
-2. Top-1 agreement ≥ 99% against the fp16 reference on a fixed prompt set
-3. wikitext-2 perplexity, reported as an absolute number and a delta
-4. tok/s over ≥256 generated tokens after warmup, median with p10/p90
+2. **wikitext-2 perplexity**, absolute and as a delta against fp16 in the *same*
+   harness — this is the gate, and the only one that has never misled us
+3. tok/s over ≥256 generated tokens after warmup, median with p10/p90,
+   **interleaved** with anything it is being compared against
+4. For a numerics change, **bit-identical token ids** from a fixed prompt
+
+Two things that look like quality gates and are not:
+
+- **Top-1 agreement on a few prompts.** int4-g128 read "100% top-1" on three
+  prompts and costs +2.73 perplexity over 40,940 predictions.
+- **Weight relative error.** A clip search that lowers it raises perplexity by
+  0.50; GPTQ raises it and lowers perplexity by 1.73. `convert` still prints it,
+  as a smoke test for a broken packer and nothing more.
 
 ## License
 

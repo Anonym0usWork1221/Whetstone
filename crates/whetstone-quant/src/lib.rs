@@ -1,34 +1,51 @@
 //! Weight quantization and bit packing.
 //!
-//! # Why int4 group-128
+//! # Which format, and how that was decided
 //!
-//! Measured on Qwen2.5-0.5B by quantizing every linear weight and comparing
-//! output distributions against the unquantized model:
+//! [`hier`] holds the production format: int4 with group 32 and hierarchical
+//! scale metadata. This module keeps the group-128 format it replaced, because
+//! an A/B against the thing you are improving on should be one flag.
 //!
-//! | format | bits/wt | output KL (nats) | top-1 agreement |
-//! |---|---|---|---|
-//! | int8 per-channel | 8.00 | 0.014 | 100% |
-//! | **int4 g128** | **4.25** | **0.187** | **100%** |
-//! | int3 g128 | 3.25 | 1.969 | 33% |
-//! | int2 g128 | 2.25 | 12.432 | 0% |
-//! | ternary g128 | 1.71 | 10.936 | 0% |
+//! Measured on Qwen2.5-0.5B, wikitext-2, 20x2048 windows, the 168 transformer
+//! projections quantized and the head left in fp16 — perplexity delta against
+//! fp16, which reads 13.8182 on this stream:
 //!
-//! There is a cliff between 4 and 3 bits, and round-to-nearest ternary destroys
-//! the model outright. That is not a contradiction of the 1-bit LLM literature:
-//! those models are *trained* in ternary with a straight-through estimator, so
-//! their weights are built to lie on that grid, and the published results are
-//! overwhelmingly on 7B+ models with far more redundancy than 0.5B.
+//! | format | bits/weight | Δ perplexity |
+//! |---|---|---|
+//! | int4 g128, fp16 scale + fp16 zero | 4.250 | +2.730 |
+//! | the same, with llama.cpp's complete k-quant fit | 4.250 | +2.575 |
+//! | int4 g64, fp16 scale + fp16 zero | 4.500 | +1.771 |
+//! | **int4 g32, hierarchical (see [`hier`])** | **4.277** | **+1.575** |
 //!
-//! int4-g128 is therefore the format Whetstone targets: a 3.8x bandwidth
-//! reduction that costs no top-1 agreement.
+//! **Group size is worth about six times what the fitting algorithm is worth**,
+//! and the only reason the group-128 format could not have it is that an fp16
+//! scale plus an fp16 zero per group of 32 costs 1.0 bits/weight of metadata
+//! against group 128's 0.25.
+//!
+//! # Two things this module reports that are not quality measures
+//!
+//! [`relative_error`] is a smoke test for a broken packer, not a quality gate.
+//! Measured on this model: a clip search that *lowers* mean weight error from
+//! 0.1102 to 0.1067 *raises* perplexity by 0.50, and GPTQ *raises* weight error
+//! to 0.1416 while *lowering* perplexity by 1.73. Weight error and output error
+//! are different objectives and they do not reliably move together.
+//!
+//! Top-1 agreement on a handful of prompts is worse still. An earlier version of
+//! this file reported int4-g128 at "100% top-1 agreement, costs nothing"; over
+//! 40,940 predictions the same format costs +2.73 perplexity. The argmax is
+//! stable long after the distribution has moved.
+//!
+//! Use `whetstone ppl`.
 
 #![deny(missing_docs)]
 
 pub mod format;
+pub mod hier;
 
 use half::f16;
 
 pub use format::{Header, TensorEntry, TensorKind, Writer};
+pub use hier::{dequantize_int4_hier, quantize_int4_hier, PackedInt4Hier, HGROUP};
 
 /// Errors from quantization and the `.wstone` container.
 #[derive(Debug, thiserror::Error)]

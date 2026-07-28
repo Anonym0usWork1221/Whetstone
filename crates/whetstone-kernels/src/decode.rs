@@ -342,6 +342,43 @@ pub fn embed_int4(
     })
 }
 
+/// Gathers and dequantizes row `token` of an int4 hierarchical-scale table.
+pub fn embed_int4_hier(
+    qw: &DeviceBuffer<u32>,
+    si: &DeviceBuffer<u8>,
+    sb: &DeviceBuffer<u32>,
+    token: &DeviceCursor,
+    out: &mut DeviceBuffer<f32>,
+) -> Result<()> {
+    let hidden = out.len();
+    if hidden == 0 || hidden % whetstone_hgroup() != 0 {
+        return Err(Error::Shape(format!("embed: hidden {hidden} must be a multiple of 32")));
+    }
+    let rows = qw.len() / (hidden / 8);
+    if si.len() != rows * hidden / whetstone_hgroup() || sb.len() != rows {
+        return Err(Error::Shape("embed: scale metadata does not match the table".into()));
+    }
+    // SAFETY: the row count is derived from the packed buffer's real length and
+    // cross-checked against both metadata arrays; the kernel clamps the
+    // device-resident token into that range, which the host cannot do because
+    // inside a captured graph it never sees the value.
+    check(unsafe {
+        ffi::wst_embed_int4_hier(
+            qw.as_ptr(),
+            si.as_ptr(),
+            sb.as_ptr(),
+            token.buf.as_ptr(),
+            out.as_mut_ptr(),
+            hidden as i32,
+            rows as i32,
+        )
+    })
+}
+
+const fn whetstone_hgroup() -> usize {
+    crate::gemv::HGROUP
+}
+
 /// Writes the index of the largest logit into a one-element device buffer.
 ///
 /// Stays on the device: the logit vector is 608 KB for Qwen2.5, and copying it

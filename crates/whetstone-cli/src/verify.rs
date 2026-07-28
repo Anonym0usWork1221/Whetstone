@@ -93,24 +93,53 @@ pub fn run(wstone: &Path, source: Option<&Path>, bandwidth: Option<f64>) -> Resu
     let mut checked = 0usize;
 
     for t in &header.tensors {
-        if t.kind != TensorKind::Int4G128 {
+        // Filter to the 2-D quantized kinds FIRST. `model.norm.weight` and the
+        // q/k/v biases are rank-1, so reading `shape[1]` before this check is an
+        // out-of-bounds panic on a perfectly valid file.
+        if !matches!(t.kind, TensorKind::Int4G128 | TensorKind::Int4HierG32) {
             continue;
         }
+        if t.shape.len() != 2 {
+            return Err(anyhow::anyhow!(
+                "{}: quantized tensors must be rank 2, found shape {:?}",
+                t.name,
+                t.shape
+            ));
+        }
         let Ok(src) = st.to_f32(&t.name) else { continue };
+        let (in_features, out_features) = (t.shape[1], t.shape[0]);
 
-        let qw_b = t.blob("qw").map_err(|e| anyhow::anyhow!("{e}"))?;
-        let sz_b = t.blob("sz").map_err(|e| anyhow::anyhow!("{e}"))?;
-
-        let qw = read_u32(&bytes, qw_b.offset, qw_b.len);
-        let sz = read_u32(&bytes, sz_b.offset, sz_b.len);
-
-        let packed = whetstone_quant::PackedInt4 {
-            qw,
-            sz,
-            in_features: t.shape[1],
-            out_features: t.shape[0],
+        // Dequantizing through the real reader is the point: this measures the
+        // file as the engine will read it, so it catches a packer and a loader
+        // that disagree as well as a quantizer that is simply lossy.
+        let deq = match t.kind {
+            TensorKind::Int4G128 => {
+                let qw_b = t.blob("qw").map_err(|e| anyhow::anyhow!("{e}"))?;
+                let sz_b = t.blob("sz").map_err(|e| anyhow::anyhow!("{e}"))?;
+                let packed = whetstone_quant::PackedInt4 {
+                    qw: read_u32(&bytes, qw_b.offset, qw_b.len),
+                    sz: read_u32(&bytes, sz_b.offset, sz_b.len),
+                    in_features,
+                    out_features,
+                };
+                whetstone_quant::dequantize_int4_g128(&packed)
+            }
+            TensorKind::Int4HierG32 => {
+                let qw_b = t.blob("qw").map_err(|e| anyhow::anyhow!("{e}"))?;
+                let si_b = t.blob("si").map_err(|e| anyhow::anyhow!("{e}"))?;
+                let sb_b = t.blob("sb").map_err(|e| anyhow::anyhow!("{e}"))?;
+                let lo = si_b.offset as usize;
+                let packed = whetstone_quant::PackedInt4Hier {
+                    qw: read_u32(&bytes, qw_b.offset, qw_b.len),
+                    si: bytes[lo..lo + si_b.len as usize].to_vec(),
+                    sb: read_u32(&bytes, sb_b.offset, sb_b.len),
+                    in_features,
+                    out_features,
+                };
+                whetstone_quant::dequantize_int4_hier(&packed)
+            }
+            _ => continue,
         };
-        let deq = whetstone_quant::dequantize_int4_g128(&packed);
         errors.push((whetstone_quant::relative_error(&src, &deq), t.name.clone()));
         checked += 1;
     }
