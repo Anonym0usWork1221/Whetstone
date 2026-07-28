@@ -70,6 +70,12 @@ fn main() {
             .arg("-O3")
             .arg("-std=c++17")
             .arg("--use_fast_math") // maps expf/rsqrtf to the hardware SFU paths
+            // The legacy default stream cannot be captured into a CUDA graph.
+            // Per-thread makes every `<<<>>>` with no explicit stream target
+            // `cudaStreamPerThread`, which can -- so the whole existing kernel
+            // surface became graph-capturable without a stream parameter having
+            // to be threaded through all of it. See cuda/graph.cu.
+            .arg("--default-stream=per-thread")
             .arg("-lineinfo") // ncu/nsight attribution without -G's slowdown
             .arg("-Xptxas=-v") // register/smem usage lands in the build log
             .arg("--expt-relaxed-constexpr")

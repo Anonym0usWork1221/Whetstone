@@ -136,6 +136,154 @@ wst_status_t wst_gemv_fp16(const void *w, const void *x, void *y,
 wst_status_t wst_bench_gemv(int32_t in_f, int32_t out_f, int32_t reps,
                             int32_t use_int4, double *out_gbs, double *out_ms);
 
+/* GEMV with a fused bias add and an optional accumulate-into-y epilogue.
+ *
+ * These two extras remove four kernel launches per transformer block: the q/k/v
+ * projections carry biases in Qwen2, and o_proj/down_proj write straight into
+ * the residual stream. At 24 blocks that is ~96 launches per token, which at
+ * batch=1 is a real fraction of the token budget -- see docs/design.md.
+ *
+ *   bias  : [out_f] half, or NULL
+ *   accum : 0 -> y = Wx + b,  nonzero -> y += Wx + b
+ */
+wst_status_t wst_gemv_int4_g128_ex(const void *qw, const void *sz, const void *x,
+                                   const void *bias, void *y, int32_t in_f,
+                                   int32_t out_f, int32_t accum);
+
+wst_status_t wst_gemv_fp16_ex(const void *w, const void *x, const void *bias,
+                              void *y, int32_t in_f, int32_t out_f, int32_t accum);
+
+/* ------------------------------------------------------- GEMV variant sweep */
+
+/* Alternative int4 GEMV implementations, so the choice between them is a
+ * measurement rather than an argument. See gemv_variants.cu for what varies and
+ * why. The engine picks one at startup; the sweep is what decides which. */
+int32_t wst_gemv_variant_count(void);
+
+/* Index of the variant the sweep selected on this architecture. */
+int32_t wst_gemv_default_variant(void);
+
+/* Index of the variant the sweep selected for a particular matrix shape.
+ * No single blocking wins everywhere -- see gemv_variants.cu for the table. */
+int32_t wst_gemv_variant_for_shape(int32_t in_f, int32_t out_f);
+
+/* Override the per-shape rule: (wide reduction, huge output, everything else).
+ * Exists so the rule can be swept by whole-generation tok/s, which is the only
+ * measurement that has not misranked these kernels. */
+void wst_gemv_set_shape_rule(int32_t wide, int32_t huge, int32_t other);
+void wst_gemv_get_shape_rule(int32_t *out);
+const char *wst_gemv_variant_name(int32_t variant);
+
+wst_status_t wst_gemv_int4_variant(int32_t variant, const void *qw, const void *sz,
+                                   const void *x, const void *bias, void *y, int32_t in_f,
+                                   int32_t out_f, int32_t accum);
+
+wst_status_t wst_bench_gemv_variant(int32_t variant, int32_t in_f, int32_t out_f,
+                                    int32_t reps, double *out_gbs, double *out_ms);
+
+/* ------------------------------------------------------------ decode layers */
+
+/* out[i] = f16( x[i] * rsqrt(mean(x^2) + eps) * w[i] )
+ *
+ * The reduction runs in fp32 regardless of the input type. Accumulating 896
+ * squares in fp16 loses roughly three decimal digits, and Turing has no bf16 to
+ * fall back on.
+ *
+ *   x   : [n] float   (the residual stream)
+ *   w   : [n] half
+ *   out : [n] half    (the next projection's input)
+ */
+wst_status_t wst_rmsnorm(const void *x, const void *w, void *out, int32_t n, float eps);
+
+/* Rotary embedding on q and k, plus the append of k/v into the KV cache.
+ *
+ * Fused because all three touch the same freshly projected vectors, and because
+ * RoPE's cos/sin come from a precomputed table -- there is no arithmetic left to
+ * amortise, only launches.
+ *
+ * HuggingFace's *half rotation* layout: the head vector splits into halves and
+ * rotates across them, NOT as adjacent (even, odd) pairs. Getting this wrong
+ * yields fluent text with subtly wrong long-range behaviour.
+ *
+ *   qkv      : [n_q + 2*n_kv][head_dim] float -- one fused projection's output;
+ *              q is rotated in place, k is rotated into the cache, v is copied
+ *   k_cache  : [n_kv][max_seq][head_dim] half, written at `pos`
+ *   v_cache  : same
+ *   cos, sin : [max_seq][head_dim/2] float, precomputed in f64 on the host
+ */
+wst_status_t wst_rope_cache(void *qkv, void *k_cache, void *v_cache, const void *cos_tab,
+                            const void *sin_tab, int32_t n_q, int32_t n_kv,
+                            int32_t head_dim, const void *pos, int32_t max_seq);
+
+/* Batch=1 GQA attention against the KV cache.
+ *
+ * One block per query head, online (flash-style) softmax so nothing proportional
+ * to the sequence length is ever materialised.
+ *
+ *   q        : [n_q][head_dim] float
+ *   k/v cache: [n_kv][max_seq][head_dim] half
+ *   partials : scratch, wst_attn_partial_floats() floats
+ *   out      : [n_q][head_dim] half  (o_proj's input)
+ *
+ * The sequence is split across blocks as well as the heads -- 14 query heads
+ * cannot fill 30 SMs -- so this issues two kernels: slices, then a merge. */
+wst_status_t wst_attn_decode(const void *q, const void *k_cache, const void *v_cache,
+                             void *partials, void *out, int32_t n_q, int32_t n_kv,
+                             int32_t head_dim, const void *pos, int32_t max_seq,
+                             float scale);
+
+/* Scratch floats the sequence split needs for one layer. */
+int32_t wst_attn_partial_floats(int32_t n_q, int32_t head_dim, int32_t max_seq);
+
+/* out[i] = f16( silu(gu[i]) * gu[i+n] ),  silu(x) = x * sigmoid(x).
+ * `gu` is the 2n-wide output of one fused gate|up projection. */
+wst_status_t wst_swiglu(const void *gate_up, void *out, int32_t n);
+
+/* Gathers row `token` of a dense fp16 table into a float vector. */
+wst_status_t wst_embed_fp16(const void *table, const void *token, void *out,
+                            int32_t hidden, int32_t rows);
+
+/* Same, dequantizing on the way out of an int4-g128 table. */
+wst_status_t wst_embed_int4_g128(const void *qw, const void *sz, const void *token,
+                                 void *out, int32_t hidden, int32_t rows);
+
+/* ------------------------------------------------------------ CUDA graphs */
+
+/* Capture the decode step once, launch it per token.
+ *
+ * ~250 kernels become one launch. Everything that changes per token -- the
+ * position and the token id -- lives in device int32s, because a graph bakes its
+ * kernel arguments in at instantiation. Nothing may allocate, copy
+ * synchronously, or synchronise between begin and end. See cuda/graph.cu. */
+wst_status_t wst_graph_capture_begin(void);
+wst_status_t wst_graph_capture_end(void **out_exec);
+wst_status_t wst_graph_launch(void *exec);
+wst_status_t wst_graph_destroy(void *exec);
+wst_status_t wst_stream_sync(void);
+
+/* Stream-ordered timers. Recorded into the stream, so the host never blocks and
+ * the pipeline is never broken -- unlike a synchronise-between-stages profile,
+ * which measures its own interference as much as the work. */
+wst_status_t wst_event_create(void **out);
+wst_status_t wst_event_record(void *ev);
+wst_status_t wst_event_elapsed_ms(void *a, void *b, float *out);
+wst_status_t wst_event_destroy(void *ev);
+
+/* pos += 1, saturating at max_seq, as a graph node rather than a host update. */
+wst_status_t wst_advance_pos(void *pos, int32_t max_seq);
+
+/* ---------------------------------------------------------------- sampling */
+
+/* Greedy decode: index of the largest logit, written to a device int32. */
+wst_status_t wst_argmax(const void *logits, void *out_idx, int32_t n);
+
+/* Accumulates -log p(target) into acc[0] and bumps the count in acc[1].
+ *
+ * Both stay on the device: a perplexity run is tens of thousands of forward
+ * passes, and copying a scalar back after each one would put a synchronising
+ * transfer inside a loop that otherwise never blocks. */
+wst_status_t wst_nll(const void *logits, int32_t target, void *acc, int32_t n);
+
 #ifdef __cplusplus
 }
 #endif

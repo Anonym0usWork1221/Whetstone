@@ -12,6 +12,116 @@ use crate::{check, DeviceBuffer, Error, Result};
 /// Weights per scale/zero pair in the int4 format.
 pub const GROUP: usize = 128;
 
+/// Alternative int4 GEMV implementations, selected by measurement.
+///
+/// The engine calls [`select`] once at startup and every [`QuantLinear::gemv`]
+/// afterwards routes through the chosen kernel. Keeping the choice in one
+/// process-global integer rather than threading it through every call site is
+/// deliberate: it makes an A/B a single argument, which is the difference
+/// between a sweep that gets run and one that does not.
+pub mod variant {
+    use std::ffi::CStr;
+    use std::sync::atomic::{AtomicI32, Ordering};
+
+    use crate::ffi;
+    use crate::{check, GemvBench, Result};
+
+    /// `i32::MIN` means "not chosen yet", which resolves to the swept default
+    /// on first use. `-1` means the original hand-written kernel in
+    /// `gemv_int4.cu`, kept reachable so an A/B against it is one flag.
+    static SELECTED: AtomicI32 = AtomicI32::new(i32::MIN);
+
+    /// The variant the sweep selected for this architecture.
+    ///
+    /// Defined in `gemv_variants.cu` alongside the measurement table that
+    /// justifies it, so the number and its evidence cannot drift apart.
+    pub fn default_index() -> usize {
+        // SAFETY: no arguments, returns a compile-time constant.
+        (unsafe { ffi::wst_gemv_default_variant() }).max(0) as usize
+    }
+
+    /// The variant the sweep selected for a particular matrix shape.
+    ///
+    /// One blocking does not win everywhere: the model's shapes run from
+    /// 896x128 to 896x151936, and what changes between them is how many warps
+    /// the shape can create and therefore how many loads it can keep in flight.
+    pub fn for_shape(in_f: usize, out_f: usize) -> usize {
+        // SAFETY: two scalars in, a table index out.
+        (unsafe { ffi::wst_gemv_variant_for_shape(in_f as i32, out_f as i32) }).max(0) as usize
+    }
+
+    /// Number of swept variants.
+    pub fn count() -> usize {
+        // SAFETY: no arguments, returns a compile-time constant.
+        (unsafe { ffi::wst_gemv_variant_count() }).max(0) as usize
+    }
+
+    /// Human-readable description of a variant.
+    pub fn name(v: usize) -> String {
+        // SAFETY: the callee returns a pointer to a static string literal for
+        // any input, including out-of-range ones (it yields "?").
+        unsafe {
+            let p = ffi::wst_gemv_variant_name(v as i32);
+            if p.is_null() {
+                "?".into()
+            } else {
+                CStr::from_ptr(p).to_string_lossy().into_owned()
+            }
+        }
+    }
+
+    /// The active variant, or `None` for the baseline kernel.
+    pub fn selected() -> Option<usize> {
+        let v = SELECTED.load(Ordering::Relaxed);
+        if v == i32::MIN {
+            return Some(default_index());
+        }
+        if v < 0 {
+            None
+        } else {
+            Some(v as usize)
+        }
+    }
+
+    /// Chooses the variant every subsequent GEMV will use.
+    pub fn select(v: Option<usize>) {
+        SELECTED.store(v.map_or(-1, |x| x as i32), Ordering::Relaxed);
+    }
+
+    /// The per-shape rule: which variant serves a wide reduction, a huge
+    /// output, and everything else.
+    pub fn shape_rule() -> [usize; 3] {
+        let mut r = [0i32; 3];
+        // SAFETY: `r` is an owned, initialised array of exactly the three i32s
+        // the callee writes.
+        unsafe { ffi::wst_gemv_get_shape_rule(r.as_mut_ptr()) };
+        [r[0].max(0) as usize, r[1].max(0) as usize, r[2].max(0) as usize]
+    }
+
+    /// Overrides the per-shape rule. Out-of-range entries are ignored.
+    pub fn set_shape_rule(rule: [usize; 3]) {
+        // SAFETY: three plain scalars; the callee range-checks each one.
+        unsafe { ffi::wst_gemv_set_shape_rule(rule[0] as i32, rule[1] as i32, rule[2] as i32) };
+    }
+
+    /// True when no variant has been forced, so each shape picks its own.
+    pub fn is_auto() -> bool {
+        SELECTED.load(Ordering::Relaxed) == i32::MIN
+    }
+
+    /// Times one variant at one shape with synthetic weights.
+    pub fn bench(v: usize, in_f: usize, out_f: usize, reps: i32) -> Result<GemvBench> {
+        let mut gbs = 0.0f64;
+        let mut ms = 0.0f64;
+        // SAFETY: both out-params are owned, initialised f64s; the callee
+        // validates the variant index and shape and allocates its own buffers.
+        check(unsafe {
+            ffi::wst_bench_gemv_variant(v as i32, in_f as i32, out_f as i32, reps, &mut gbs, &mut ms)
+        })?;
+        Ok(GemvBench { gbs, ms })
+    }
+}
+
 /// A quantized linear layer, resident on the device.
 ///
 /// Layout, matching `cuda/gemv_int4.cu`:
@@ -87,6 +197,44 @@ impl QuantLinear {
 
     /// `y = W x`, with `x` in fp16 and `y` in fp32.
     pub fn gemv(&self, x: &DeviceBuffer<u16>, y: &mut DeviceBuffer<f32>) -> Result<()> {
+        self.gemv_ex(x, None, y, false)
+    }
+
+    /// Dequantizes one row into a float vector.
+    ///
+    /// This exists because a tied embedding matrix has two uses that look
+    /// nothing alike: a single-row gather on the way in (free) and a full GEMV
+    /// on the way out (27.6% of decode traffic on Qwen2.5-0.5B). Quantizing the
+    /// matrix quantizes both, so the gather has to dequantize.
+    pub fn gather_row(
+        &self,
+        row: &crate::decode::DeviceCursor,
+        out: &mut DeviceBuffer<f32>,
+    ) -> Result<()> {
+        if out.len() != self.in_features {
+            return Err(Error::Shape(format!(
+                "gather_row: output has {} elements, row width is {}",
+                out.len(),
+                self.in_features
+            )));
+        }
+        crate::decode::embed_int4(&self.qw, &self.sz, row, out)
+    }
+
+    /// `y = W x + b` or `y += W x + b`.
+    ///
+    /// Bias and accumulation are epilogue flags rather than separate kernels.
+    /// Each is one instruction on a row that has just streamed hundreds of
+    /// bytes, but as launches they would cost four dispatches per transformer
+    /// block — 96 per token on a 24-layer model, which at batch=1 is a
+    /// measurable fraction of the token.
+    pub fn gemv_ex(
+        &self,
+        x: &DeviceBuffer<u16>,
+        bias: Option<&DeviceBuffer<u16>>,
+        y: &mut DeviceBuffer<f32>,
+        accumulate: bool,
+    ) -> Result<()> {
         if x.len() != self.in_features {
             return Err(Error::Shape(format!(
                 "x has {} elements, expected {}",
@@ -101,20 +249,58 @@ impl QuantLinear {
                 self.out_features
             )));
         }
+        if let Some(b) = bias {
+            if b.len() != self.out_features {
+                return Err(Error::Shape(format!(
+                    "bias has {} elements, expected {}",
+                    b.len(),
+                    self.out_features
+                )));
+            }
+        }
 
-        // SAFETY: shapes are validated above; all four buffers are live device
-        // allocations of the sizes the kernel indexes, and the kernel writes
-        // only y[0..out_features].
-        check(unsafe {
-            ffi::wst_gemv_int4_g128(
-                self.qw.as_ptr(),
-                self.sz.as_ptr(),
-                x.as_ptr(),
-                y.as_mut_ptr(),
-                self.in_features as i32,
-                self.out_features as i32,
-            )
-        })
+        let bias_ptr = bias.map_or(std::ptr::null(), DeviceBuffer::as_ptr);
+
+        // SAFETY (both arms): shapes are validated above; all buffers are live
+        // device allocations of the sizes the kernel indexes, the bias pointer
+        // is null exactly when no bias was supplied, and the kernel writes only
+        // y[0..out_features]. The variant index comes from `variant::select`,
+        // which the callee range-checks anyway.
+        // Nothing forced: let the shape pick. Something forced: honour it, so
+        // an A/B is one flag and the sweep stays reproducible.
+        let choice = if variant::is_auto() {
+            Some(variant::for_shape(self.in_features, self.out_features))
+        } else {
+            variant::selected()
+        };
+
+        match choice {
+            None => check(unsafe {
+                ffi::wst_gemv_int4_g128_ex(
+                    self.qw.as_ptr(),
+                    self.sz.as_ptr(),
+                    x.as_ptr(),
+                    bias_ptr,
+                    y.as_mut_ptr(),
+                    self.in_features as i32,
+                    self.out_features as i32,
+                    i32::from(accumulate),
+                )
+            }),
+            Some(v) => check(unsafe {
+                ffi::wst_gemv_int4_variant(
+                    v as i32,
+                    self.qw.as_ptr(),
+                    self.sz.as_ptr(),
+                    x.as_ptr(),
+                    bias_ptr,
+                    y.as_mut_ptr(),
+                    self.in_features as i32,
+                    self.out_features as i32,
+                    i32::from(accumulate),
+                )
+            }),
+        }
     }
 }
 
@@ -130,6 +316,19 @@ pub fn gemv_fp16(
     in_features: usize,
     out_features: usize,
 ) -> Result<()> {
+    gemv_fp16_ex(w, x, None, y, in_features, out_features, false)
+}
+
+/// `y = W x + b` or `y += W x + b`, with dense fp16 weights.
+pub fn gemv_fp16_ex(
+    w: &DeviceBuffer<u16>,
+    x: &DeviceBuffer<u16>,
+    bias: Option<&DeviceBuffer<u16>>,
+    y: &mut DeviceBuffer<f32>,
+    in_features: usize,
+    out_features: usize,
+    accumulate: bool,
+) -> Result<()> {
     if w.len() != in_features * out_features {
         return Err(Error::Shape(format!(
             "weights have {} elements, expected {}",
@@ -144,15 +343,26 @@ pub fn gemv_fp16(
             y.len()
         )));
     }
-    // SAFETY: all three shapes are validated above against the dimensions the
-    // kernel indexes; the kernel writes only y[0..out_features].
+    if let Some(b) = bias {
+        if b.len() != out_features {
+            return Err(Error::Shape(format!(
+                "bias has {} elements, expected {out_features}",
+                b.len()
+            )));
+        }
+    }
+    // SAFETY: all shapes are validated above against the dimensions the kernel
+    // indexes, the bias pointer is null exactly when no bias was supplied, and
+    // the kernel writes only y[0..out_features].
     check(unsafe {
-        ffi::wst_gemv_fp16(
+        ffi::wst_gemv_fp16_ex(
             w.as_ptr(),
             x.as_ptr(),
+            bias.map_or(std::ptr::null(), DeviceBuffer::as_ptr),
             y.as_mut_ptr(),
             in_features as i32,
             out_features as i32,
+            i32::from(accumulate),
         )
     })
 }
@@ -248,6 +458,93 @@ mod tests {
                 got[r]
             );
         }
+    }
+
+    /// Every variant must agree with the dequantized reference, not just the
+    /// one currently selected.
+    ///
+    /// The `h2` variants replace an integer-to-float conversion with an OR into
+    /// an fp16 mantissa and accumulate the group's dot product on the fp16 pipe.
+    /// Both are exactly the kind of change that is fast and subtly wrong, and
+    /// both would still produce plausible text. The activations here are scaled
+    /// to the magnitudes an RMSNorm actually emits, because the fp16 accumulator
+    /// is the part with a range limit.
+    #[test]
+    fn every_variant_agrees_with_the_dequantized_reference() {
+        if gpu().is_none() {
+            eprintln!("skip: no CUDA device");
+            return;
+        }
+        // down_proj's shape: the longest reduction in the model, so the fp16
+        // group accumulator sees the most terms here.
+        let (in_f, out_f) = (4864usize, 64usize);
+
+        let w: Vec<f32> = (0..in_f * out_f)
+            .map(|i| ((i * 2_654_435_761usize) % 1000) as f32 / 500.0 - 1.0)
+            .collect();
+        let x: Vec<f32> =
+            (0..in_f).map(|i| (((i * 40503) % 200) as f32 / 100.0 - 1.0) * 4.0).collect();
+
+        let packed = whetstone_quant::quantize_int4_g128(&w, in_f, out_f).unwrap();
+        let dequant = whetstone_quant::dequantize_int4_g128(&packed);
+
+        let xh: Vec<u16> = x.iter().map(|&v| half::f16::from_f32(v).to_bits()).collect();
+        let x_dev = DeviceBuffer::from_slice(&xh).unwrap();
+        let layer = QuantLinear::from_packed(&packed.qw, &packed.sz, in_f, out_f).unwrap();
+
+        let want: Vec<f32> = (0..out_f)
+            .map(|r| {
+                (0..in_f)
+                    .map(|c| {
+                        dequant[r * in_f + c] as f64 * half::f16::from_f32(x[c]).to_f32() as f64
+                    })
+                    .sum::<f64>() as f32
+            })
+            .collect();
+
+        let n = variant::count();
+        assert!(n > 0, "no GEMV variants compiled in");
+
+        // Relative L2 error against the reference, per variant. Printing it is
+        // the point: the `h2` variants are an explicit precision-for-speed
+        // trade, and a number is the only way to argue about the size of it.
+        for v in 0..n {
+            let label = variant::name(v);
+            // The memory-path probe deliberately computes the wrong thing --
+            // its job is to measure the floor, not to be correct.
+            if label.starts_with("mem") {
+                continue;
+            }
+
+            variant::select(Some(v));
+            let mut y = DeviceBuffer::<f32>::zeros(out_f).unwrap();
+            layer.gemv(&x_dev, &mut y).unwrap();
+            let got = y.to_vec().unwrap();
+
+            let (mut num, mut den) = (0f64, 0f64);
+            for r in 0..out_f {
+                let d = (got[r] - want[r]) as f64;
+                num += d * d;
+                den += (want[r] as f64) * (want[r] as f64);
+            }
+            let rel = (num / den).sqrt();
+            println!("  variant {v:>2} {label:<14} relative error {rel:.5}");
+
+            if label.starts_with("f32") {
+                // fp32 accumulation must reproduce the reference to within f16
+                // input rounding and nothing more.
+                assert!(rel < 5e-3, "variant {v} ({label}) drifted: relative error {rel}");
+            } else {
+                // The fp16 accumulator carries 11 mantissa bits into a reduction
+                // whose terms largely cancel, so it loses precision in proportion
+                // to how much cancellation there is -- worst at down_proj's 4864
+                // terms, which is the shape used here. This bound only catches a
+                // *bug*; whether the remaining error is affordable is a question
+                // for perplexity, not for a tolerance invented here.
+                assert!(rel < 0.10, "variant {v} ({label}) is broken, not just imprecise: {rel}");
+            }
+        }
+        variant::select(None);
     }
 
     #[test]

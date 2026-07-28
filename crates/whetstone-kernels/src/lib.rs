@@ -17,11 +17,16 @@ use std::ffi::{c_char, c_void, CStr};
 use std::fmt;
 use std::marker::PhantomData;
 
+pub mod decode;
 mod ffi;
 pub mod gemv;
 
+pub use decode::{
+    argmax, attn_decode, embed_fp16, embed_int4, nll, rmsnorm, rope_cache, stream_sync, swiglu,
+    DeviceCursor, Event, Graph, KvCache, RopeTable,
+};
 pub use ffi::{DeviceInfo, ProbeResult};
-pub use gemv::{bench_gemv, gemv_fp16, GemvBench, QuantLinear, GROUP};
+pub use gemv::{bench_gemv, gemv_fp16, gemv_fp16_ex, variant, GemvBench, QuantLinear, GROUP};
 
 /// Errors crossing the CUDA boundary.
 #[derive(Debug, thiserror::Error)]

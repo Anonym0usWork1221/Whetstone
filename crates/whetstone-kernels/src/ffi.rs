@@ -152,21 +152,9 @@ extern "C" {
     pub(crate) fn wst_probe(out: *mut ProbeResult, iters: i32) -> i32;
     pub(crate) fn wst_bench_bandwidth(bytes: usize, reps: i32, out_gbs: *mut f64) -> i32;
 
-    pub(crate) fn wst_gemv_int4_g128(
-        qw: *const c_void,
-        sz: *const c_void,
-        x: *const c_void,
-        y: *mut c_void,
-        in_f: i32,
-        out_f: i32,
-    ) -> i32;
-    pub(crate) fn wst_gemv_fp16(
-        w: *const c_void,
-        x: *const c_void,
-        y: *mut c_void,
-        in_f: i32,
-        out_f: i32,
-    ) -> i32;
+    // `wst_gemv_int4_g128` and `wst_gemv_fp16` also exist in the C ABI as
+    // bias-free, non-accumulating shorthands. Rust always goes through the `_ex`
+    // forms below, so they are deliberately not declared here.
     pub(crate) fn wst_bench_gemv(
         in_f: i32,
         out_f: i32,
@@ -175,6 +163,123 @@ extern "C" {
         out_gbs: *mut f64,
         out_ms: *mut f64,
     ) -> i32;
+
+    pub(crate) fn wst_gemv_int4_g128_ex(
+        qw: *const c_void,
+        sz: *const c_void,
+        x: *const c_void,
+        bias: *const c_void,
+        y: *mut c_void,
+        in_f: i32,
+        out_f: i32,
+        accum: i32,
+    ) -> i32;
+    pub(crate) fn wst_gemv_fp16_ex(
+        w: *const c_void,
+        x: *const c_void,
+        bias: *const c_void,
+        y: *mut c_void,
+        in_f: i32,
+        out_f: i32,
+        accum: i32,
+    ) -> i32;
+
+    pub(crate) fn wst_gemv_variant_count() -> i32;
+    pub(crate) fn wst_gemv_default_variant() -> i32;
+    pub(crate) fn wst_gemv_variant_for_shape(in_f: i32, out_f: i32) -> i32;
+    pub(crate) fn wst_gemv_set_shape_rule(wide: i32, huge: i32, other: i32);
+    pub(crate) fn wst_gemv_get_shape_rule(out: *mut i32);
+    pub(crate) fn wst_gemv_variant_name(variant: i32) -> *const c_char;
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn wst_gemv_int4_variant(
+        variant: i32,
+        qw: *const c_void,
+        sz: *const c_void,
+        x: *const c_void,
+        bias: *const c_void,
+        y: *mut c_void,
+        in_f: i32,
+        out_f: i32,
+        accum: i32,
+    ) -> i32;
+    pub(crate) fn wst_bench_gemv_variant(
+        variant: i32,
+        in_f: i32,
+        out_f: i32,
+        reps: i32,
+        out_gbs: *mut f64,
+        out_ms: *mut f64,
+    ) -> i32;
+
+    pub(crate) fn wst_rmsnorm(
+        x: *const c_void,
+        w: *const c_void,
+        out: *mut c_void,
+        n: i32,
+        eps: f32,
+    ) -> i32;
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn wst_rope_cache(
+        qkv: *mut c_void,
+        k_cache: *mut c_void,
+        v_cache: *mut c_void,
+        cos_tab: *const c_void,
+        sin_tab: *const c_void,
+        n_q: i32,
+        n_kv: i32,
+        head_dim: i32,
+        pos: *const c_void,
+        max_seq: i32,
+    ) -> i32;
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn wst_attn_decode(
+        q: *const c_void,
+        k_cache: *const c_void,
+        v_cache: *const c_void,
+        partials: *mut c_void,
+        out: *mut c_void,
+        n_q: i32,
+        n_kv: i32,
+        head_dim: i32,
+        pos: *const c_void,
+        max_seq: i32,
+        scale: f32,
+    ) -> i32;
+    pub(crate) fn wst_attn_partial_floats(n_q: i32, head_dim: i32, max_seq: i32) -> i32;
+
+    pub(crate) fn wst_swiglu(gate_up: *const c_void, out: *mut c_void, n: i32) -> i32;
+
+    pub(crate) fn wst_embed_fp16(
+        table: *const c_void,
+        token: *const c_void,
+        out: *mut c_void,
+        hidden: i32,
+        rows: i32,
+    ) -> i32;
+    pub(crate) fn wst_embed_int4_g128(
+        qw: *const c_void,
+        sz: *const c_void,
+        token: *const c_void,
+        out: *mut c_void,
+        hidden: i32,
+        rows: i32,
+    ) -> i32;
+
+    pub(crate) fn wst_graph_capture_begin() -> i32;
+    pub(crate) fn wst_graph_capture_end(out_exec: *mut *mut c_void) -> i32;
+    pub(crate) fn wst_graph_launch(exec: *mut c_void) -> i32;
+    pub(crate) fn wst_graph_destroy(exec: *mut c_void) -> i32;
+    pub(crate) fn wst_stream_sync() -> i32;
+    pub(crate) fn wst_event_create(out: *mut *mut c_void) -> i32;
+    pub(crate) fn wst_event_record(ev: *mut c_void) -> i32;
+    pub(crate) fn wst_event_elapsed_ms(a: *mut c_void, b: *mut c_void, out: *mut f32) -> i32;
+    pub(crate) fn wst_event_destroy(ev: *mut c_void) -> i32;
+    pub(crate) fn wst_advance_pos(pos: *mut c_void, max_seq: i32) -> i32;
+
+    pub(crate) fn wst_argmax(logits: *const c_void, out_idx: *mut c_void, n: i32) -> i32;
+    pub(crate) fn wst_nll(logits: *const c_void, target: i32, acc: *mut c_void, n: i32) -> i32;
 }
 
 #[cfg(test)]

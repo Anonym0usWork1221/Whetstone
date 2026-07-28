@@ -8,6 +8,19 @@ use anyhow::{bail, Context, Result};
 use whetstone_core::{ModelConfig, SafeTensors};
 use whetstone_quant::{format, quantize_int4_g128, relative_error, PackedInt4};
 
+/// Precision for the transformer-block projections.
+///
+/// `Fp16` exists to keep a lossless reference path alive at all times. Without
+/// one there is no way to separate "the engine is wrong" from "the quantizer is
+/// lossy", and those two failures look identical from a perplexity number.
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum BodyPrecision {
+    /// int4 group-128. The production format.
+    Int4,
+    /// Dense fp16. 988 MB for Qwen2.5-0.5B, and the differential-testing baseline.
+    Fp16,
+}
+
 /// Precision for the output projection.
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum HeadPrecision {
@@ -35,6 +48,7 @@ pub fn run(
     model_dir: &Path,
     out_path: &Path,
     head: HeadPrecision,
+    body: BodyPrecision,
     bandwidth: Option<f64>,
 ) -> Result<()> {
     let cfg = ModelConfig::from_dir(model_dir)
@@ -63,7 +77,13 @@ pub fn run(
     let mut w = format::Writer::new(BufWriter::new(file), raw_config, 1 << 20)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    w.set_quant_meta("scheme", "int4-g128-asymmetric");
+    w.set_quant_meta(
+        "scheme",
+        match body {
+            BodyPrecision::Int4 => "int4-g128-asymmetric",
+            BodyPrecision::Fp16 => "fp16",
+        },
+    );
     w.set_quant_meta("group", "128");
     w.set_quant_meta("method", "rtn");
     w.set_quant_meta("source", &weights.display().to_string());
@@ -89,6 +109,12 @@ pub fn run(
             let (out_f, in_f) = t.shape_2d()?;
 
             let w32 = st.to_f32(&name)?;
+
+            if body == BodyPrecision::Fp16 {
+                write_fp16(&mut w, &name, &w32, &[out_f, in_f])?;
+                n_dense += 1;
+                continue;
+            }
 
             if in_f % whetstone_quant::GROUP != 0 {
                 // Not representable in this format; keep it dense rather than

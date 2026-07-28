@@ -13,4 +13,5 @@ thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 memmap2.workspace = true
+whetstone-quant.workspace = true
 half.workspace = true

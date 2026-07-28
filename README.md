@@ -12,12 +12,15 @@ then measures, at every step, whether that actually made anything faster.
 - **Reference GPU:** NVIDIA RTX 2060 — `sm_75` Turing, 30 SMs, 6 GB, 336 GB/s
 - **Stack:** CUDA C++ kernels, Rust engine, Python for evaluation
 
-> **Status: the weight pipeline works end to end; the executor does not yet.**
-> Conversion, the `.wstone` format, verification, the int4 decode GEMV and the
-> whole measurement stack are done and tested. The full forward pass
-> (RMSNorm, RoPE, attention, SwiGLU) is the next milestone — see
-> [docs/ROADMAP.md](docs/ROADMAP.md). Every number below is measured on the
-> reference GPU, not projected.
+> **Status: the executor works, and it is 1.53× llama.cpp Q4_K_M on the
+> reference GPU** — 431.8 tok/s against 282.95, generating 384 tokens of the
+> same model on the same card. Perplexity is reported for every format, because
+> speed without a quality number is not a result. Every number below is measured
+> on the reference GPU, not projected.
+>
+> Prefill still runs the decode path one token at a time, which is the honest
+> starting point and not what a fast engine does. See
+> [docs/ROADMAP.md](docs/ROADMAP.md).
 
 > **This is a research project, not a production engine.** If you want to run a
 > quantized model today, use [llama.cpp](https://github.com/ggml-org/llama.cpp)
@@ -245,29 +248,37 @@ you a week.
 Not an estimate — llama.cpp built from source for `sm_75` and run on the same
 RTX 2060 with the same checkpoint (`llama-bench`, 3 repetitions):
 
-| engine | format | bytes/token | decode | prefill | % of its own roofline |
-|---|---|---|---|---|---|
-| HuggingFace | fp16 | 988 MB | 36.8 tok/s | ~4,000 tok/s | 13% |
-| **llama.cpp** | **fp16** | 988 MB | **137.2 tok/s** | 13,452 tok/s | **49%** |
-| **llama.cpp** | **Q4_K_M** | 392 MB | **296.9 tok/s** | 10,539 tok/s | **42%** |
-| Whetstone | int4 `.wstone` | **263 MB** | *no executor yet* | — | ceiling 1,059 |
+| engine | format | bytes/token | decode (tg384) | wikitext-2 ppl |
+|---|---|---|---|---|
+| HuggingFace | fp16 | 988 MB | 36.8 tok/s | 13.8182 |
+| llama.cpp | fp16 | 988 MB | 137.2 tok/s | — |
+| **llama.cpp** | **Q4_K_M** | 392 MB | **282.95 ± 3.61** | — |
+| Whetstone | fp16 | 988 MB | 185.6 tok/s | **13.8209** |
+| Whetstone | int4, fp16 head | 462 MB | 305.9 tok/s | **16.5696** |
+| **Whetstone** | **int4 `.wstone`** | **262 MB** | **431.8 tok/s** | **18.0287** |
 
-Three things follow, and none of them flatter this project:
+**1.53× llama.cpp Q4_K_M**, at 1.49× fewer bytes per token. Three things follow,
+and only one of them flatters this project:
 
-1. **llama.cpp is 8.1x the HuggingFace baseline** on identical hardware. The
-   "~9x of framework overhead" identified above is real — llama.cpp has already
+1. **llama.cpp is 7.7× the HuggingFace baseline** on identical hardware. The
+   "~9× of framework overhead" identified above is real — llama.cpp had already
    collected it. That was never novel headroom; it was the gap between a Python
    research framework and a competent C++ engine.
-2. **llama.cpp attains 42-49% of the bandwidth roofline.** Whetstone's fp16 GEMV
-   reaches 60-69% in isolation, but an isolated GEMV is not an engine; the gap
-   between those numbers is attention, norms, sampling and scheduling.
-3. **The one real advantage is bytes.** `.wstone` int4 reads 263 MB/token against
-   Q4_K_M's 392 MB — **1.49x fewer**. That is the entire theoretical edge.
+2. **The advantage is bytes.** `.wstone` int4 reads 262 MB/token against
+   Q4_K_M's 392 MB. That is the entire structural edge, and the speed ratio
+   (1.53×) tracks the byte ratio (1.49×) almost exactly — which is what the
+   roofline says should happen.
+3. **It costs quality.** int4-g128 round-to-nearest is 4.2 perplexity worse than
+   fp16 on this model. Q4_K_M's own perplexity was not re-measured here, so the
+   speed comparison above is *not* a like-for-like quality comparison, and the
+   table says so rather than quietly implying otherwise.
 
-So the honest upside: if Whetstone's executor eventually matched llama.cpp's
-roofline attainment, 42% of 1,059 is **~445 tok/s**, or about **1.5x**
-llama.cpp. That is the prize, and claiming it means building a complete engine
-as well-tuned as a project with years of work behind it.
+Whetstone's fp16 path is the control: **13.8209 against HuggingFace's 13.8182**
+on the same 40,940 predictions — a 0.02% difference. That is what says the
+engine is right and the perplexity gap is the quantizer, not a bug.
+
+*(An earlier version of this README projected "~445 tok/s, about 1.5×
+llama.cpp" from the roofline. Measured: 431.8 and 1.53×.)*
 
 **Reproduce this yourself:**
 
@@ -380,10 +391,26 @@ python bench/chat.py --model /path/to/model --bench --out report.json
 ────────────────────────────────────────────────────────────────────
 ```
 
-`--engine whetstone` is wired but not yet runnable: the `.wstone` format,
-quantizer and int4 GEMV are done, the full forward pass is not. It fails with a
-clear message rather than silently falling back to the baseline — see
-[docs/ROADMAP.md](docs/ROADMAP.md).
+### Running the engine
+
+```bash
+# Convert once, then execute with no Python in the token loop
+whetstone convert /path/to/Qwen2.5-0.5B-Instruct -o model.wstone --head int4
+whetstone run model.wstone --ids 785,6722,315,9625,374 --max-new 256 --graph
+
+# Quality gate: perplexity over a fixed token stream, comparable to any
+# harness reading the same file
+python bench/prepare_tokens.py --model /path/to/model --out wikitext2.u32
+whetstone ppl model.wstone --tokens wikitext2.u32 --window 2048 --windows 20
+
+# Where the time goes, and which kernel to use for each shape
+whetstone run model.wstone --ids 785 --profile 64
+whetstone tune model.wstone
+```
+
+`--body fp16` produces a lossless reference model. Keeping one runnable at all
+times is what separates "the engine is wrong" from "the quantizer is lossy" —
+two failures that look identical from a perplexity number alone.
 
 ## Evaluation harness
 

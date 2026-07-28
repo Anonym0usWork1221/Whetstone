@@ -77,8 +77,9 @@ __global__ __launch_bounds__(WST_THREADS) void gemv_int4_g128_kernel(
     const uint4 *__restrict__ qw,
     const half2 *__restrict__ sz,
     const half *__restrict__ x,
+    const half *__restrict__ bias,
     float *__restrict__ y,
-    int in_f, int out_f, int rows_per_block) {
+    int in_f, int out_f, int rows_per_block, int accum) {
 
   const int warp = threadIdx.x / WST_WARP;
   const int lane = threadIdx.x % WST_WARP;
@@ -171,8 +172,15 @@ __global__ __launch_bounds__(WST_THREADS) void gemv_int4_g128_kernel(
 #pragma unroll
     for (int t = 0; t < WST_TILE; ++t) {
       if (t >= ntile) break;
-      const float r = warp_reduce_sum(acc[t]);
-      if (lane == 0) y[row + t] = r;
+      float r = warp_reduce_sum(acc[t]);
+      if (lane == 0) {
+        /* Bias and the residual add ride in the epilogue rather than in kernels
+         * of their own. Each costs one instruction against a row that has just
+         * streamed hundreds of bytes; as separate launches they would cost four
+         * dispatches per transformer block. */
+        if (bias) r += __half2float(bias[row + t]);
+        y[row + t] = accum ? y[row + t] + r : r;
+      }
     }
   }
 }
@@ -185,7 +193,8 @@ __global__ __launch_bounds__(WST_THREADS) void gemv_int4_g128_kernel(
  * scalar half loads waste three quarters of every transaction. */
 __global__ __launch_bounds__(WST_THREADS) void gemv_fp16_kernel(
     const half *__restrict__ w, const half *__restrict__ x,
-    float *__restrict__ y, int in_f, int out_f, int rows_per_block) {
+    const half *__restrict__ bias, float *__restrict__ y,
+    int in_f, int out_f, int rows_per_block, int accum) {
 
   extern __shared__ half sx[];
   for (int i = threadIdx.x; i < in_f; i += blockDim.x) sx[i] = x[i];
@@ -212,7 +221,10 @@ __global__ __launch_bounds__(WST_THREADS) void gemv_fp16_kernel(
     }
 
     acc = warp_reduce_sum(acc);
-    if (lane == 0) y[row] = acc;
+    if (lane == 0) {
+      if (bias) acc += __half2float(bias[row]);
+      y[row] = accum ? y[row] + acc : acc;
+    }
   }
 }
 
@@ -243,9 +255,9 @@ static int pick_rows_per_block(int out_f) {
 
 /* ------------------------------------------------------------------ ABI */
 
-extern "C" wst_status_t wst_gemv_int4_g128(const void *qw, const void *sz,
-                                           const void *x, void *y,
-                                           int32_t in_f, int32_t out_f) {
+extern "C" wst_status_t wst_gemv_int4_g128_ex(const void *qw, const void *sz,
+                                              const void *x, const void *bias, void *y,
+                                              int32_t in_f, int32_t out_f, int32_t accum) {
   WST_REQUIRE(qw && sz && x && y, "wst_gemv_int4_g128: null pointer");
   WST_REQUIRE(in_f > 0 && out_f > 0, "wst_gemv_int4_g128: non-positive dimension");
   WST_REQUIRE(in_f % WST_GROUP == 0,
@@ -254,15 +266,22 @@ extern "C" wst_status_t wst_gemv_int4_g128(const void *qw, const void *sz,
   const int rows = pick_rows_per_block(out_f);
   const int blocks = (out_f + rows - 1) / rows;
   gemv_int4_g128_kernel<<<blocks, WST_THREADS>>>(
-      (const uint4 *)qw, (const half2 *)sz, (const half *)x, (float *)y,
-      in_f, out_f, rows);
+      (const uint4 *)qw, (const half2 *)sz, (const half *)x, (const half *)bias,
+      (float *)y, in_f, out_f, rows, accum);
 
   WST_TRY_KERNEL("wst_gemv_int4_g128");
   return WST_OK;
 }
 
-extern "C" wst_status_t wst_gemv_fp16(const void *w, const void *x, void *y,
-                                      int32_t in_f, int32_t out_f) {
+extern "C" wst_status_t wst_gemv_int4_g128(const void *qw, const void *sz,
+                                           const void *x, void *y,
+                                           int32_t in_f, int32_t out_f) {
+  return wst_gemv_int4_g128_ex(qw, sz, x, nullptr, y, in_f, out_f, 0);
+}
+
+extern "C" wst_status_t wst_gemv_fp16_ex(const void *w, const void *x, const void *bias,
+                                         void *y, int32_t in_f, int32_t out_f,
+                                         int32_t accum) {
   WST_REQUIRE(w && x && y, "wst_gemv_fp16: null pointer");
   WST_REQUIRE(in_f > 0 && out_f > 0, "wst_gemv_fp16: non-positive dimension");
   WST_REQUIRE(in_f % 2 == 0, "wst_gemv_fp16: in_features must be even for half2 loads");
@@ -273,10 +292,16 @@ extern "C" wst_status_t wst_gemv_fp16(const void *w, const void *x, void *y,
   const int rows = pick_rows_per_block(out_f);
   const int blocks = (out_f + rows - 1) / rows;
   gemv_fp16_kernel<<<blocks, WST_THREADS, smem>>>(
-      (const half *)w, (const half *)x, (float *)y, in_f, out_f, rows);
+      (const half *)w, (const half *)x, (const half *)bias, (float *)y,
+      in_f, out_f, rows, accum);
 
   WST_TRY_KERNEL("wst_gemv_fp16");
   return WST_OK;
+}
+
+extern "C" wst_status_t wst_gemv_fp16(const void *w, const void *x, void *y,
+                                      int32_t in_f, int32_t out_f) {
+  return wst_gemv_fp16_ex(w, x, nullptr, y, in_f, out_f, 0);
 }
 
 /* Times a GEMV and reports achieved bandwidth, which is the only figure of
