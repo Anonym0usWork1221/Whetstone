@@ -26,11 +26,18 @@ Versioning is [semantic](https://semver.org/), with one project-specific rule:
 
 ## [0.2.0] — 2026-07-28
 
-**The executor works.** `whetstone run` executes a `.wstone` end to end with no
-Python in the token loop, at **431.8 tok/s** against llama.cpp Q4_K_M's
-**282.95** on the same RTX 2060, same model, same 384-token generation —
-**1.53x**, at 1.49x fewer bytes per token. (431.8 is the median of five cold
-process launches; run-to-run spans 418-443. A warm engine reaches 486.)
+**The executor works, and measuring it against llama.cpp properly produced a
+result that is half good news.**
+
+`whetstone run` executes a `.wstone` end to end with no Python in the token
+loop, at **423.9 tok/s** against llama.cpp Q4_K_M's **281.9** on the same RTX
+2060 and model — **1.50x**, at 1.49x fewer bytes per token.
+
+**The quantizer is 13x worse than Q4_K_M.** int4-g128 round-to-nearest costs
+**+4.21 perplexity** against fp16; Q4_K_M costs **+0.33** against its own. That
+is not a bit-budget difference: k-quants keep the embedding and output wide, so
+Q4_K_M is 6.35 bits/weight, and Whetstone's 7.49-bit variant still costs +2.75 --
+worse at more bits. The engine is not the problem; the rounding is.
 
 The correctness claim rests on the fp16 path: wikitext-2 perplexity **13.8209**
 against HuggingFace's **13.8182** over the same 40,940 predictions, a 0.02%
@@ -61,6 +68,12 @@ the `.wstone` loader at once.
   lossy"; without it the perplexity figures below would be guesses.
 - `bench/prepare_tokens.py` — materialises the evaluation token stream once, so
   two harnesses provably read the same tokens
+- `bench/compare.py` — one command that measures your `.wstone`, the original
+  weights and llama.cpp in a single run, and anchors each format's perplexity to
+  fp16 *in its own harness* (the two disagree by 1.57 on identical weights, so
+  absolute figures cannot be read across)
+- `baseline_hf.py --tokens` — the HuggingFace baseline can now read the
+  materialised token stream instead of re-tokenizing the corpus itself
 - CUDA graph capture of the whole decode step (`--graph`)
 
 ### Changed
@@ -81,17 +94,31 @@ the `.wstone` loader at once.
 
 ### Measured
 
-| format | bits/wt | bytes/token | tok/s (tg384) | wikitext-2 ppl |
-|---|---|---|---|---|
-| fp16 | 16.00 | 987.9 MB | 185.6 | 13.8209 |
-| int4 body, fp16 head | 7.49 | 462.4 MB | 305.9 | 16.5696 |
-| int4 everywhere | 4.25 | 262.4 MB | 431.8 | 18.0287 |
+All rows from one run of the new `bench/compare.py`:
 
-**int4-g128 round-to-nearest costs 2.75 perplexity, and `--head int4` costs
-another 1.46.** The 0.1.0 notes reported int4 at "100% top-1 agreement" — true,
-and measured on three prompts, which is not enough to detect a regression of
-this size. Top-1 agreement is not a quality gate; the argmax stays stable long
-after the distribution has moved.
+| engine / format | bits/wt | bytes/token | decode tok/s | ppl | Δ vs own fp16 |
+|---|---|---|---|---|---|
+| HuggingFace fp16 | 16.00 | 988 MB | 40.3 | 13.8182 | *(anchor)* |
+| llama.cpp fp16 | 16.00 | 988 MB | 131.0 | 12.2484 | *(anchor)* |
+| **llama.cpp Q4_K_M** | 6.35 | 392 MB | **281.9** | 12.5737 | **+0.3253** |
+| Whetstone fp16 | 16.00 | 988 MB | 211.6 | 13.8209 | +0.0028 |
+| Whetstone int4 body | 7.49 | 462 MB | 331.2 | 16.5712 | +2.7530 |
+| **Whetstone int4** | 4.25 | 262 MB | **423.9** | 18.0287 | **+4.2106** |
+
+Engines are **interleaved** — one sample of each, round-robin — because measuring
+all of A then all of B compares A cold to B hot. An earlier run of this harness
+did exactly that and read llama.cpp at 250.8 instead of 281.9, inflating the
+speed ratio from 1.50× to 1.69×.
+
+**Absolute perplexity is not comparable across the two harnesses** — the *same
+fp16 weights* score 13.8182 here and 12.2484 under `llama-perplexity`, a
+1.57-point offset from different tokenization and chunking. Only the last column
+is comparable.
+
+The 0.1.0 notes reported int4 at "100% top-1 agreement" — true, and measured on
+three prompts, which is not enough to detect a regression of this size. Top-1
+agreement is not a quality gate; the argmax stays stable long after the
+distribution has moved.
 
 ### Negative results
 

@@ -163,8 +163,25 @@ def bench_prefill(model, tok, lengths: list[int], warmup: int) -> list[dict]:
 # --------------------------------------------------------------------------- quality
 
 @torch.inference_mode()
-def perplexity(model, tok, window: int, max_windows: int) -> dict:
-    """wikitext-2-raw-v1 test perplexity over non-overlapping windows."""
+def perplexity(model, tok, window: int, max_windows: int,
+               token_file: str | None = None) -> dict:
+    """Perplexity over non-overlapping windows.
+
+    `token_file` points at a flat little-endian `uint32` stream produced by
+    `bench/prepare_tokens.py`. **Prefer it.** Passing a corpus *name* to two
+    harnesses does not guarantee they see the same tokens — tokenizer versions
+    differ, and so does how documents get joined — and a perplexity comparison
+    between implementations that read different tokens is not a comparison. When
+    no file is given this falls back to loading wikitext-2 itself, which is
+    convenient and only comparable to itself.
+    """
+    if token_file:
+        import numpy as np
+
+        ids_np = np.fromfile(token_file, dtype="<u4")
+        ids = torch.from_numpy(ids_np.astype("int64")).unsqueeze(0).to("cuda")
+        return _ppl_over(model, ids, window, max_windows, f"file:{token_file}")
+
     # `datasets` >= 5 requires a fully qualified namespace/name, so the bare
     # "wikitext" id that most published harnesses use no longer resolves.
     # Try the canonical id first and fall back for older installs.
@@ -182,6 +199,12 @@ def perplexity(model, tok, window: int, max_windows: int) -> dict:
         return {"error": "could not load wikitext2 -- " + " | ".join(errors)}
 
     ids = tok(text, return_tensors="pt").input_ids.to("cuda")
+    return _ppl_over(model, ids, window, max_windows, "wikitext-2-raw-v1/test")
+
+
+@torch.inference_mode()
+def _ppl_over(model, ids, window: int, max_windows: int, source: str) -> dict:
+    """The window loop itself, shared by both token sources."""
     n = min(max_windows, ids.shape[1] // window)
 
     # Cross-entropy over a full window would materialise
@@ -210,7 +233,7 @@ def perplexity(model, tok, window: int, max_windows: int) -> dict:
         torch.cuda.empty_cache()
 
     return {
-        "dataset": "wikitext-2-raw-v1/test",
+        "dataset": source,
         "window": window,
         "windows": n,
         "tokens": count,
@@ -269,6 +292,15 @@ def main() -> int:
     ap.add_argument("--ppl-window", type=int, default=2048)
     ap.add_argument("--ppl-windows", type=int, default=40)
     ap.add_argument("--skip-ppl", action="store_true")
+    ap.add_argument("--tokens", default=None,
+                    help="flat u32 token stream from bench/prepare_tokens.py. Use this "
+                         "when comparing against another implementation: it is the only "
+                         "way to guarantee both read the same tokens.")
+    ap.add_argument("--gen", type=int, default=None,
+                    help="alias for --decode-tokens, so comparison harnesses can use "
+                         "one flag name across engines")
+    ap.add_argument("--json", action="store_true",
+                    help="print a compact JSON summary on stdout, for scripting")
     ap.add_argument("--bandwidth", type=float, default=336.0, help="hardware GB/s")
     args = ap.parse_args()
 
@@ -316,8 +348,8 @@ def main() -> int:
 
     # ---- decode -----------------------------------------------------------
     print("  [decode] batch=1 greedy, per-token timing ...")
-    dec = bench_decode(model, tok, args.decode_tokens, "The history of computing began",
-                       args.warmup)
+    dec = bench_decode(model, tok, args.gen or args.decode_tokens,
+                       "The history of computing began", args.warmup)
     report["decode"] = dec
 
     # Achieved bandwidth: one full pass over blocks + lm_head per token.
@@ -352,9 +384,10 @@ def main() -> int:
               f"p={r['topk_probs'][0]:.3f}")
     print()
 
-    if not args.skip_ppl:
-        print(f"  [perplexity] wikitext-2, {args.ppl_windows} x {args.ppl_window} tokens ...")
-        ppl = perplexity(model, tok, args.ppl_window, args.ppl_windows)
+    if not args.skip_ppl and args.ppl_windows > 0:
+        src = Path(args.tokens).name if args.tokens else "wikitext-2"
+        print(f"  [perplexity] {src}, {args.ppl_windows} x {args.ppl_window} tokens ...")
+        ppl = perplexity(model, tok, args.ppl_window, args.ppl_windows, args.tokens)
         report["perplexity"] = ppl
         if "error" in ppl:
             print(f"           SKIPPED: {ppl['error']}")
@@ -376,6 +409,17 @@ def main() -> int:
     print(f"  TARGET TO BEAT: {dec['tok_per_s_median']:.1f} tok/s "
           f"at ppl {report.get('perplexity', {}).get('ppl', float('nan')):.4f}")
     print("  " + "-" * 62)
+
+    if args.json:
+        print(json.dumps({
+            "decode": dec["tok_per_s_median"],
+            "decode_p10_ms": dec["ms_p10"],
+            "decode_p90_ms": dec["ms_p90"],
+            "mb_per_token": nonembed_b / 1e6,
+            "ppl": report.get("perplexity", {}).get("ppl"),
+            "nll": report.get("perplexity", {}).get("nll"),
+            "positions": report.get("perplexity", {}).get("tokens"),
+        }))
     return 0
 
 

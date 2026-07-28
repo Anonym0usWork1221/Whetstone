@@ -51,6 +51,10 @@ def main() -> int:
     ap.add_argument("--corpus", default="wikitext2", choices=["wikitext2", "file"])
     ap.add_argument("--text", help="path to a UTF-8 file, when --corpus file")
     ap.add_argument("--limit", type=int, default=0, help="truncate to N tokens (0 = all)")
+    ap.add_argument("--dump-text", default=None,
+                    help="also write the raw corpus here. llama.cpp's perplexity tool "
+                         "tokenizes text itself, so giving it this file is the closest "
+                         "the two harnesses can get to reading the same thing.")
     args = ap.parse_args()
 
     sys.path.insert(0, str(Path(__file__).parent))
@@ -66,6 +70,11 @@ def main() -> int:
         text = Path(args.text).read_text(encoding="utf-8")
 
     print(f"corpus: {len(text):,} characters")
+    if args.dump_text:
+        dt = Path(args.dump_text)
+        dt.parent.mkdir(parents=True, exist_ok=True)
+        dt.write_text(text, encoding="utf-8")
+        print(f"wrote {dt}  ({len(text):,} characters)")
     ids = tok.encode(text)
     if args.limit:
         ids = ids[: args.limit]

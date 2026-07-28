@@ -13,20 +13,28 @@ it with no Python and no framework in the token loop.
 
 Measured on the reference GPU, same model, `llama-bench`:
 
-| engine | format | bytes/token | decode (tg384) |
-|---|---|---|---|
-| HuggingFace | fp16 | 988 MB | 36.8 tok/s |
-| **llama.cpp** | **Q4_K_M** | 392 MB | **282.95 ± 3.61** |
-| **Whetstone** | **int4 `.wstone`** | **262 MB** | **431.8 tok/s** |
+| engine | format | bits/wt | bytes/token | decode (tg384) | Δ ppl vs own fp16 |
+|---|---|---|---|---|---|
+| HuggingFace | fp16 | 16.00 | 988 MB | 40.3 | *(anchor)* |
+| **llama.cpp** | **Q4_K_M** | 6.35 | 392 MB | **281.9** | **+0.3253** |
+| **Whetstone** | **int4 `.wstone`** | 4.25 | **262 MB** | **423.9** | **+4.2106** |
 
-llama.cpp is the real competitor, not HuggingFace. Whetstone's structural edge
-is **1.49× fewer bytes per token**, and the measured speed ratio is **1.53×** —
-the roofline said the two should track each other, and they do. Every stage
-below is judged against llama.cpp, not against the HuggingFace baseline.
+llama.cpp is the real competitor, not HuggingFace, and the comparison splits
+cleanly in two:
 
-The cost is quality: int4-g128 round-to-nearest is **+4.2 perplexity** against
-fp16 on this model (18.0287 vs 13.8209). Closing that, not going faster, is now
-the top of the list.
+- **Speed: won.** 1.50×, from reading 1.49× fewer bytes per token. The roofline
+  said the ratios would track, and they do.
+- **Quality: lost, by a lot.** Q4_K_M costs +0.33 perplexity against its own
+  fp16; int4-g128 round-to-nearest costs +4.21. Not a bit-budget excuse —
+  k-quants keep the embedding and output wide, so Q4_K_M is really 6.35
+  bits/weight, and Whetstone's 7.49-bit variant *still* costs +2.75.
+
+Every stage below is judged against llama.cpp on **both** axes. Stage 5 is now
+the only one that matters.
+
+*(Absolute perplexity is not comparable across the two harnesses — the same fp16
+weights read 13.8182 here and 12.2484 under `llama-perplexity`. Only the
+same-harness delta is. `bench/compare.py` measures fp16 in both for this reason.)*
 
 Status keys: **done** · *in progress* · planned
 

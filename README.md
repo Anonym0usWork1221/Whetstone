@@ -12,11 +12,11 @@ then measures, at every step, whether that actually made anything faster.
 - **Reference GPU:** NVIDIA RTX 2060 — `sm_75` Turing, 30 SMs, 6 GB, 336 GB/s
 - **Stack:** CUDA C++ kernels, Rust engine, Python for evaluation
 
-> **Status: the executor works, and it is 1.53× llama.cpp Q4_K_M on the
-> reference GPU** — 431.8 tok/s against 282.95, generating 384 tokens of the
-> same model on the same card. Perplexity is reported for every format, because
-> speed without a quality number is not a result. Every number below is measured
-> on the reference GPU, not projected.
+> **Status: the executor works and is 1.50× llama.cpp Q4_K_M on the reference
+> GPU — but the quantizer is 13× worse.** 423.9 tok/s against 281.9, and +4.21
+> perplexity against Q4_K_M's +0.33. The speed is real; the format that buys it
+> is not competitive yet. Both numbers are below, together, because either one
+> alone is misleading.
 >
 > Prefill still runs the decode path one token at a time, which is the honest
 > starting point and not what a fast engine does. See
@@ -248,36 +248,44 @@ you a week.
 Not an estimate — llama.cpp built from source for `sm_75` and run on the same
 RTX 2060 with the same checkpoint (`llama-bench`, 3 repetitions):
 
-| engine | format | bytes/token | decode (tg384) | wikitext-2 ppl |
-|---|---|---|---|---|
-| HuggingFace | fp16 | 988 MB | 36.8 tok/s | 13.8182 |
-| llama.cpp | fp16 | 988 MB | 137.2 tok/s | — |
-| **llama.cpp** | **Q4_K_M** | 392 MB | **282.95 ± 3.61** | — |
-| Whetstone | fp16 | 988 MB | 185.6 tok/s | **13.8209** |
-| Whetstone | int4, fp16 head | 462 MB | 305.9 tok/s | **16.5696** |
-| **Whetstone** | **int4 `.wstone`** | **262 MB** | **431.8 tok/s** | **18.0287** |
+| engine / format | bits/wt | bytes/token | decode tok/s | ppl | Δ vs own fp16 |
+|---|---|---|---|---|---|
+| HuggingFace fp16 | 16.00 | 988 MB | 40.3 | 13.8182 | *(anchor)* |
+| llama.cpp fp16 | 16.00 | 988 MB | 131.0 | 12.2484 | *(anchor)* |
+| **llama.cpp Q4_K_M** | 6.35 | 392 MB | **281.9** | 12.5737 | **+0.3253** |
+| Whetstone fp16 | 16.00 | 988 MB | 211.6 | 13.8209 | +0.0028 |
+| Whetstone int4 body | 7.49 | 462 MB | 331.2 | 16.5712 | +2.7530 |
+| **Whetstone int4** | 4.25 | 262 MB | **423.9** | 18.0287 | **+4.2106** |
 
-**1.53× llama.cpp Q4_K_M**, at 1.49× fewer bytes per token.
+Engines are **interleaved** — one sample of each, round-robin — because measuring
+all of A then all of B compares A cold to B hot. An earlier run of this harness
+did exactly that and read llama.cpp at 250.8 instead of 281.9, inflating the
+speed ratio from 1.50× to 1.69×.
 
-*(431.8 is the median of five cold process launches; run-to-run across ten
-launches spans 418–443. A warm engine — several generations in one process,
-which is what a server does — reaches 486. The table uses the conservative
-figure.)*
+**Absolute perplexity is not comparable across the two harnesses** — the *same
+fp16 weights* score 13.8182 here and 12.2484 under `llama-perplexity`, a
+1.57-point offset from different tokenization and chunking. Only the last column
+is comparable.
 
-Three things follow, and only one of them flatters this project:
+Two results, and they point in opposite directions:
 
-1. **llama.cpp is 7.7× the HuggingFace baseline** on identical hardware. The
-   "~9× of framework overhead" identified above is real — llama.cpp had already
-   collected it. That was never novel headroom; it was the gap between a Python
-   research framework and a competent C++ engine.
-2. **The advantage is bytes.** `.wstone` int4 reads 262 MB/token against
-   Q4_K_M's 392 MB. That is the entire structural edge, and the speed ratio
-   (1.53×) tracks the byte ratio (1.49×) almost exactly — which is what the
-   roofline says should happen.
-3. **It costs quality.** int4-g128 round-to-nearest is 4.2 perplexity worse than
-   fp16 on this model. Q4_K_M's own perplexity was not re-measured here, so the
-   speed comparison above is *not* a like-for-like quality comparison, and the
-   table says so rather than quietly implying otherwise.
+**The engine is 1.50× llama.cpp Q4_K_M** — 423.9 tok/s against 281.9, reading
+1.49× fewer bytes per token. The speed ratio tracks the byte ratio, which is
+what the roofline says should happen.
+
+**The quantizer is 13× worse.** Q4_K_M costs +0.33 perplexity against its own
+fp16; Whetstone's int4-g128 round-to-nearest costs +4.21. And that is not a
+bit-budget excuse: k-quants keep the embedding and output projection wide, so
+Q4_K_M is really **6.35** bits/weight, not four. Whetstone's 7.49-bit variant —
+*more* bits than Q4_K_M — still costs +2.75. The gap is the rounding, not the
+budget.
+
+So the honest summary is: **a fast engine wrapped around a naive quantizer.**
+Round-to-nearest was never going to compete with k-quants, and the earlier
+"100% top-1 agreement" reading (three prompts) hid how far behind it is.
+Closing that — GPTQ at adequate calibration, AWQ-style scaling,
+sensitivity-aware bit allocation — is worth more than any remaining speed work,
+and is what [docs/ROADMAP.md](docs/ROADMAP.md) Stage 5 is now about.
 
 Whetstone's fp16 path is the control: **13.8209 against HuggingFace's 13.8182**
 on the same 40,940 predictions — a 0.02% difference. That is what says the
