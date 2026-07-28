@@ -134,7 +134,7 @@ mkdir -p "$STAGE"/{bin,bench,docs}
 
 install -m 0755 target/release/whetstone "$STAGE/bin/whetstone"
 install -m 0644 bench/chat.py bench/baseline_hf.py bench/reference_numpy.py \
-                bench/tokenizer.py "$STAGE/bench/"
+                bench/tokenizer.py bench/prepare_tokens.py "$STAGE/bench/"
 install -m 0644 README.md LICENSE "$STAGE/"
 install -m 0644 docs/FORMAT.md docs/ROADMAP.md "$STAGE/docs/"
 [[ -f CHANGELOG.md ]] && install -m 0644 CHANGELOG.md "$STAGE/"

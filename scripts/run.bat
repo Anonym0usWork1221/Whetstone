@@ -5,6 +5,10 @@ rem   run.bat probe                          what this GPU can do
 rem   run.bat inspect  <model_dir>           architecture + roofline
 rem   run.bat convert  <model_dir> [out]     build a .wstone
 rem   run.bat verify   <file.wstone> [src]   check integrity and fidelity
+rem   run.bat run      <file.wstone> --ids   generate, and report tok/s
+rem   run.bat ppl      <file.wstone> --tokens <f>   wikitext-2 perplexity
+rem   run.bat tune     <file.wstone>         pick the per-shape GEMV kernel
+rem   run.bat tokens   [model_dir] [out]     tokenize wikitext-2 for ppl
 rem   run.bat chat     [model_dir]           interactive chat, live tok/s
 rem   run.bat bench    [model_dir]           throughput run
 rem   run.bat download [dest]                fetch the reference model
@@ -33,6 +37,10 @@ if "%CMD%"=="probe"    goto :rust
 if "%CMD%"=="inspect"  goto :rust
 if "%CMD%"=="convert"  goto :convert
 if "%CMD%"=="verify"   goto :verify
+if "%CMD%"=="run"      goto :rust
+if "%CMD%"=="ppl"      goto :rust
+if "%CMD%"=="tune"     goto :rust
+if "%CMD%"=="tokens"   goto :tokens
 if "%CMD%"=="chat"     goto :chat
 if "%CMD%"=="bench"    goto :bench
 if "%CMD%"=="baseline" goto :baseline
@@ -66,6 +74,17 @@ rem ------------------------------------------------------------- rust paths
 :rust
 call :need_bin || exit /b 1
 "%BIN%" %CMD% %*
+exit /b %ERRORLEVEL%
+
+:tokens
+call :need_py || exit /b 1
+set "MODEL=%~1"
+if "%MODEL%"=="" set "MODEL=%DEFAULT_MODEL%"
+if not "%~1"=="" shift
+set "OUT=%~1"
+if "%OUT%"=="" set "OUT=%HERE%\tokens.u32"
+if not "%~1"=="" shift
+"%PY%" "%BENCH%\prepare_tokens.py" --model "%MODEL%" --out "%OUT%" %*
 exit /b %ERRORLEVEL%
 
 :convert

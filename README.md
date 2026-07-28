@@ -257,8 +257,14 @@ RTX 2060 with the same checkpoint (`llama-bench`, 3 repetitions):
 | Whetstone | int4, fp16 head | 462 MB | 305.9 tok/s | **16.5696** |
 | **Whetstone** | **int4 `.wstone`** | **262 MB** | **431.8 tok/s** | **18.0287** |
 
-**1.53× llama.cpp Q4_K_M**, at 1.49× fewer bytes per token. Three things follow,
-and only one of them flatters this project:
+**1.53× llama.cpp Q4_K_M**, at 1.49× fewer bytes per token.
+
+*(431.8 is the median of five cold process launches; run-to-run across ten
+launches spans 418–443. A warm engine — several generations in one process,
+which is what a server does — reaches 486. The table uses the conservative
+figure.)*
+
+Three things follow, and only one of them flatters this project:
 
 1. **llama.cpp is 7.7× the HuggingFace baseline** on identical hardware. The
    "~9× of framework overhead" identified above is real — llama.cpp had already

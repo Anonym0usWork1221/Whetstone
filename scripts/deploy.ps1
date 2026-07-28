@@ -189,7 +189,8 @@ New-Item -ItemType Directory -Force -Path $Stage, "$Stage\bin", "$Stage\bench", 
 
 Copy-Item $Exe "$Stage\bin\whetstone.exe"
 Copy-Item "$Root\bench\chat.py","$Root\bench\baseline_hf.py",
-          "$Root\bench\reference_numpy.py","$Root\bench\tokenizer.py" "$Stage\bench\"
+          "$Root\bench\reference_numpy.py","$Root\bench\tokenizer.py",
+          "$Root\bench\prepare_tokens.py" "$Stage\bench\"
 if (Test-Path "$Root\scripts\download_model.py") {
     Copy-Item "$Root\scripts\download_model.py" "$Stage\bench\"
 }

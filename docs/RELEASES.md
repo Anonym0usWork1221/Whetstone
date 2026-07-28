@@ -31,13 +31,15 @@ nvidia-smi --query-gpu=name,compute_cap --format=csv
 ### Archive layout
 
 ```
-whetstone-0.1.0-linux-x86_64-sm75/
-├── bin/whetstone            the CLI (probe, inspect, convert, verify)
+whetstone-0.2.0-linux-x86_64-sm75/
+├── bin/whetstone            the CLI (probe, inspect, convert, verify,
+│                             run, ppl, logits, bench, tune)
 ├── bench/
 │   ├── chat.py              live chat + throughput benchmark
 │   ├── baseline_hf.py       HF baseline: tok/s, bandwidth, perplexity
 │   ├── reference_numpy.py   independent fp64 forward pass
 │   ├── tokenizer.py         byte-level BPE from tokenizer.json
+│   ├── prepare_tokens.py    materialise an evaluation token stream
 │   └── download_model.py    fetch the reference model
 ├── docs/{FORMAT,ROADMAP}.md
 ├── run.sh                   one launcher for everything
@@ -56,8 +58,8 @@ optional and needs its own environment — `./run.sh setup` builds one.
 ## Using a release
 
 ```bash
-tar xzf whetstone-0.1.0-linux-x86_64-sm75.tar.gz
-cd whetstone-0.1.0-linux-x86_64-sm75
+tar xzf whetstone-0.2.0-linux-x86_64-sm75.tar.gz
+cd whetstone-0.2.0-linux-x86_64-sm75
 
 ./run.sh doctor      # GPU, driver, binary, Python, model — all at once
 ./run.sh probe       # measured throughput of every arithmetic path
@@ -84,7 +86,7 @@ sha256sum -c SHA256SUMS
 ```
 
 ```powershell
-(Get-FileHash -Algorithm SHA256 whetstone-0.1.0-windows-x86_64-sm75.zip).Hash
+(Get-FileHash -Algorithm SHA256 whetstone-0.2.0-windows-x86_64-sm75.zip).Hash
 ```
 
 ---
@@ -115,22 +117,24 @@ Both are checked by CI, and a mismatch fails the release before anything builds.
 
 ```bash
 # Cargo.toml [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 
-# CHANGELOG.md: move Unreleased items under a new ## [0.2.0] — YYYY-MM-DD
+# CHANGELOG.md: move Unreleased items under a new ## [0.3.0] — YYYY-MM-DD
 ```
 
-Record measured numbers in the changelog entry, not adjectives. "1.5–1.9×
-wall-clock over fp16" is checkable; "much faster" is not.
+Record measured numbers in the changelog entry, not adjectives. "431.8 tok/s
+against llama.cpp's 282.95" is checkable; "much faster" is not. Record the
+**quality** number in the same entry — a release that is 1.5x faster and 2.75
+perplexity worse is a trade the reader has to be able to see.
 
 ### 3. Tag and push
 
 ```bash
 git add -A
-git commit -m "Release 0.2.0"
-git tag -a v0.2.0 -m "Whetstone 0.2.0"
+git commit -m "Release 0.3.0"
+git tag -a v0.3.0 -m "Whetstone 0.3.0"
 git push origin main
-git push origin v0.2.0
+git push origin v0.3.0
 ```
 
 The tag push triggers `.github/workflows/release.yml`, which:

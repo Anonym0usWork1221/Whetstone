@@ -6,6 +6,10 @@
 #   ./run.sh inspect  <model_dir>           architecture + roofline
 #   ./run.sh convert  <model_dir> [out]     build a .wstone
 #   ./run.sh verify   <file.wstone> [src]   check integrity and fidelity
+#   ./run.sh run      <file.wstone> --ids   generate, and report tok/s
+#   ./run.sh ppl      <file.wstone> <toks>  wikitext-2 perplexity
+#   ./run.sh tune     <file.wstone>         pick the per-shape GEMV kernel
+#   ./run.sh tokens   [model_dir] [out]     tokenize wikitext-2 for ppl
 #   ./run.sh chat     [model_dir]           interactive chat, live tok/s
 #   ./run.sh bench    [model_dir]           throughput run
 #   ./run.sh download [dest]                fetch the reference model
@@ -13,7 +17,15 @@
 #   ./run.sh doctor                         diagnose the environment
 #
 # The Rust subcommands need only the binary. The Python ones (chat, bench,
-# download) need a virtualenv, which `setup` creates in ./.venv.
+# tokens, download) need a virtualenv, which `setup` creates in ./.venv.
+#
+# A typical first run:
+#
+#   ./run.sh download
+#   ./run.sh convert models/Qwen2.5-0.5B-Instruct model.wstone --head int4
+#   ./run.sh run     model.wstone --ids 785,6722,315,9625,374 --max-new 256 --graph
+#   ./run.sh tokens  models/Qwen2.5-0.5B-Instruct wikitext2.u32
+#   ./run.sh ppl     model.wstone wikitext2.u32
 
 set -Eeuo pipefail
 
@@ -72,6 +84,32 @@ case "$cmd" in
         model="$(resolve_model "${1:-}")"; shift || true
         out="${1:-$HERE/model.wstone}"; shift || true
         exec "$BIN" convert "$model" -o "$out" "$@"
+        ;;
+
+    run)
+        need_bin
+        f="${1:?usage: run.sh run <file.wstone> --ids 785,6722,... [--max-new N]}"; shift || true
+        exec "$BIN" run "$f" "$@"
+        ;;
+
+    ppl)
+        need_bin
+        f="${1:?usage: run.sh ppl <file.wstone> <tokens.u32> [--windows N]}"; shift || true
+        t="${1:?usage: run.sh ppl <file.wstone> <tokens.u32> [--windows N]}"; shift || true
+        exec "$BIN" ppl "$f" --tokens "$t" "$@"
+        ;;
+
+    tune)
+        need_bin
+        f="${1:?usage: run.sh tune <file.wstone>}"; shift || true
+        exec "$BIN" tune "$f" "$@"
+        ;;
+
+    tokens)
+        need_py
+        model="$(resolve_model "${1:-}")"; [[ $# -gt 0 ]] && shift || true
+        out="${1:-$HERE/tokens.u32}"; [[ $# -gt 0 ]] && shift || true
+        exec "$PY" "$BENCH/prepare_tokens.py" --model "$model" --out "$out" "$@"
         ;;
 
     chat)
