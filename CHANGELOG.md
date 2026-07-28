@@ -62,6 +62,13 @@ stack are done and tested. The full forward pass is the next milestone.
 - `bench/baseline_hf.py` — HuggingFace baseline: tok/s, achieved bandwidth,
   wikitext-2 perplexity, reference logits
 
+**Documentation**
+- README states plainly what is and is not novel: the int4 pipeline is a
+  reimplementation of GPTQ/GGUF-era work, and the uncommon parts are the
+  abandoned-`sm_75` niche, Turing's unexploited INT4/INT1 tensor cores, and the
+  published negative results
+- `docs/RELEASES.md`, `docs/FORMAT.md`, `docs/ROADMAP.md`
+
 **Packaging**
 - `scripts/deploy.sh` / `scripts/deploy.ps1` — versioned, checksummed release
   packages for Linux and Windows

@@ -93,6 +93,17 @@ jobs:
         with:
           key: ${{ matrix.name }}-sm${{ env.WHETSTONE_CUDA_ARCH }}
 
+      # nvcc uses MSVC as its host compiler on Windows. The runner has Visual
+      # Studio installed but does not put cl.exe on PATH, so vcvars must be run
+      # first -- this action does that and exports the environment to later
+      # steps. Must come before the CUDA install, which probes for a host
+      # compiler.
+      - name: Set up MSVC (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
       - name: Install CUDA toolkit
         uses: Jimver/cuda-toolkit@v0.2.19
         with:

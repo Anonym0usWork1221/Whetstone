@@ -10,7 +10,9 @@ name: ci
 
 on:
   push:
-    branches: [main]
+    # Both names, so CI runs whether the default branch is called master or
+    # main. A workflow that silently never triggers is worse than no workflow.
+    branches: [main, master]
   pull_request:
   workflow_dispatch:
 
@@ -34,6 +36,17 @@ jobs:
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
+
+      # nvcc uses MSVC as its host compiler on Windows. The runner has Visual
+      # Studio installed but does not put cl.exe on PATH, so vcvars must be run
+      # first -- this action does that and exports the environment to later
+      # steps. Must come before the CUDA install, which probes for a host
+      # compiler.
+      - name: Set up MSVC (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
 
       - name: Install CUDA toolkit
         uses: Jimver/cuda-toolkit@v0.2.19

@@ -1,11 +1,12 @@
 # Whetstone
 
-A from-scratch LLM inference engine that replaces the arithmetic inside existing
-transformer layers with cheaper primitives — sub-byte integer formats, bit-packed
-weights, and XOR/popcount dot products — to raise tokens/second on low-end GPUs.
+**An experiment in making LLM inference much, much faster on cheap GPUs — by
+replacing the arithmetic inside existing transformer layers with sub-byte
+integer formats, bit-packed weights, and XOR/popcount dot products.**
 
 Whetstone does not invent a new architecture. It keeps trained weights and layer
-topology exactly as they are, and replaces **the math that evaluates them**.
+topology exactly as they are, and replaces **the math that evaluates them** —
+then measures, at every step, whether that actually made anything faster.
 
 - **Reference model:** Qwen2.5-0.5B-Instruct (494 M params, 988 MB bf16)
 - **Reference GPU:** NVIDIA RTX 2060 — `sm_75` Turing, 30 SMs, 6 GB, 336 GB/s
@@ -17,6 +18,12 @@ topology exactly as they are, and replaces **the math that evaluates them**.
 > (RMSNorm, RoPE, attention, SwiGLU) is the next milestone — see
 > [docs/ROADMAP.md](docs/ROADMAP.md). Every number below is measured on the
 > reference GPU, not projected.
+
+> **This is a research project, not a production engine.** If you want to run a
+> quantized model today, use [llama.cpp](https://github.com/ggml-org/llama.cpp)
+> — it is mature, fast, and supports this hardware. Read
+> [Prior art](#prior-art--what-is-actually-new-here) for an honest account of
+> what here is genuinely new and what is a reimplementation of solved problems.
 
 ---
 
@@ -168,6 +175,83 @@ calibration set was 293 tokens, so `H = 2XᵀX` has rank ≤ 293 against dimensi
 of 896 and 4864. Every Hessian was rank-deficient and dominated by damping. That
 experiment needs re-running with ~262k calibration tokens before any conclusion
 about sub-4-bit is drawn.
+
+---
+
+## Prior art — what is actually new here
+
+Being straight about this, because a repo that overstates its novelty wastes
+everyone's time.
+
+### What is not new
+
+Essentially the whole current pipeline is a reimplementation of solved problems:
+
+| in this repo | who did it first, and better |
+|---|---|
+| int4 group-128 asymmetric quantization | **GPTQ** (2022), AWQ, GGUF `Q4_0`/`Q4_K`. This is the standard format, unchanged. |
+| the `.wstone` container | **GGUF** — self-describing, mmap-able, aligned, embedded config, and an actual ecosystem. `.wstone` is a GGUF with fewer features and no users. |
+| int4 decode GEMV kernel | **llama.cpp** `mul_mat_vec_q`, **exllamav2**, AWQ kernels — all faster and battle-tested. |
+| HF → quantized converter | `convert_hf_to_gguf.py` + `llama-quantize`, AutoGPTQ, AutoAWQ, optimum. |
+| chat CLI with a tok/s readout | `llama-cli`, ollama, LM Studio. |
+| an inference engine in Rust | **candle**, **mistral.rs**, burn. |
+
+**Converting a model to 4 bits is a commodity.** If that is what you need, use
+llama.cpp.
+
+### What is uncommon
+
+Three things, honestly ranked.
+
+**1. Turing (`sm_75`) has been abandoned by every serious engine.** Verified
+against primary sources:
+
+| engine | on sm_75 |
+|---|---|
+| Marlin | requires `cc >= 8.0` and `cp.async` — **vLLM refuses it on sm_75** |
+| TensorRT-LLM | Turing **removed** from the support matrix |
+| BitBLAS / Ladder | codegen targets sm_80+ |
+| FlashAttention-2 / 3 | sm_80+ |
+
+Only llama.cpp still supports this hardware properly. Every modern low-bit
+kernel is architected around `cp.async`, which Turing does not have — so the
+software pipeline has to be re-derived from scratch with register
+double-buffering. That is a genuine gap, though it exists because the hardware
+is old rather than because the problem is hard.
+
+**2. Turing's INT4 and INT1 tensor cores are unexploited by anyone.** No
+production engine uses them. llama.cpp's Turing path uses INT8 IMMA; even its
+1-bit `Q1_0` format unpacks to `int8` and uses `dp4a` — no `popc`, no
+`bmma_sync`. NVIDIA deprecated `s4`/`b1` after Turing.
+
+The 610 TOPS binary path measured here is real and verified on-device. The
+catch, established by this project's own measurements, is that it does **not**
+help decode, because decode is bandwidth-bound. It can only pay off in prefill
+or speculative verification, where the regime is compute-bound. That is the
+most defensible direction available.
+
+**3. The measurements, including the ones that failed.** Most projects publish
+what worked. This one publishes the bits-versus-quality curve on real weights,
+the negative results with numbers (round-to-nearest ternary destroys this model:
+KL 10.9 nats, 0% top-1 agreement), and a log of four published figures that
+turned out to be wrong — a roofline that omitted `lm_head`, a 32× units error on
+`dp4a`/`popc`, an unstated half-rate fp16 baseline, and a CPU-starved benchmark.
+
+If you are about to try "just make the weights 1-bit," the data here will save
+you a week.
+
+### So what is this for
+
+An experiment in **what actually governs inference speed on cheap hardware**,
+with the measurements to back every claim. The headline result so far is not
+about exotic arithmetic at all:
+
+> The baseline reaches **11% of its own roofline**. Roughly 24 ms of every 27 ms
+> token is framework overhead, not memory traffic. Removing that is worth ~9×
+> and costs *zero* accuracy — more than quantization, and safer.
+
+That finding is the opposite of where this project started, and it came from
+measuring the baseline instead of assuming it was near-optimal.
 
 ---
 

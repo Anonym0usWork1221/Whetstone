@@ -71,7 +71,8 @@ nvcc not found. Whetstone needs the CUDA Toolkit.
   3. Or set CUDA_PATH to your toolkit root
 "@
 }
-$nvccVersion = (nvcc --version | Select-String -Pattern "release ([0-9.]+)").Matches.Groups[1].Value
+$nvccMatch = nvcc --version | Select-String -Pattern "release ([0-9.]+)" | Select-Object -First 1
+$nvccVersion = if ($nvccMatch) { $nvccMatch.Matches[0].Groups[1].Value } else { "unknown" }
 Ok "nvcc $nvccVersion"
 
 # nvcc needs the MSVC host compiler. Failing here with a clear message beats
@@ -130,8 +131,9 @@ Info "building whetstone $Version ($GitSha) for sm_$Arch"
 $env:WHETSTONE_CUDA_ARCH = $Arch
 $env:WHETSTONE_GIT_SHA   = $GitSha
 if (-not $env:SOURCE_DATE_EPOCH) {
-    $env:SOURCE_DATE_EPOCH = [string][int][double]::Parse(
-        (Get-Date -UFormat %s))
+    # DateTimeOffset avoids Get-Date -UFormat %s, whose output is locale
+    # dependent and fails to parse where the decimal separator is a comma.
+    $env:SOURCE_DATE_EPOCH = [string][DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
 }
 
 cargo build --release --locked
@@ -212,6 +214,8 @@ Check your card:
 
 $Zip = Join-Path $Out "$Name.zip"
 if (Test-Path $Zip) { Remove-Item -Force $Zip }
+# Archive the staging directory itself so the zip expands to a single
+# versioned folder rather than scattering files into the current directory.
 Compress-Archive -Path $Stage -DestinationPath $Zip -CompressionLevel Optimal
 
 $hash = (Get-FileHash -Algorithm SHA256 $Zip).Hash.ToLower()
