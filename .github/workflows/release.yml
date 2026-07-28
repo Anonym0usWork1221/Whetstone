@@ -76,11 +76,9 @@ jobs:
         include:
           - os: ubuntu-22.04
             name: linux-x86_64
-            script: ./scripts/deploy.sh --skip-tests
             artifact: "*.tar.gz*"
           - os: windows-2022
             name: windows-x86_64
-            script: powershell -ExecutionPolicy Bypass -File scripts/deploy.ps1 -SkipTests
             artifact: "*.zip*"
 
     runs-on: ${{ matrix.os }}
@@ -120,7 +118,14 @@ jobs:
           rustc --version
           cargo --version
 
-      - name: Build and package
+      # Split per-OS rather than sharing one bash step.
+      #
+      # Running the Windows build under `shell: bash` puts Git for Windows'
+      # /usr/bin at the front of PATH, where it ships a coreutils `link.exe`.
+      # rustc then invokes THAT instead of MSVC's linker and fails with
+      # "extra operand ...". PowerShell does not prepend that directory.
+      - name: Build and package (Linux)
+        if: runner.os == 'Linux'
         shell: bash
         env:
           WHETSTONE_GIT_SHA: ${{ github.sha }}
@@ -128,7 +133,16 @@ jobs:
           set -euo pipefail
           # Reproducible build stamp from the tagged commit, not from "now".
           export SOURCE_DATE_EPOCH=$(git log -1 --pretty=%ct)
-          ${{ matrix.script }}
+          ./scripts/deploy.sh --skip-tests
+
+      - name: Build and package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          WHETSTONE_GIT_SHA: ${{ github.sha }}
+        run: |
+          $env:SOURCE_DATE_EPOCH = (git log -1 --pretty=%ct)
+          .\scripts\deploy.ps1 -SkipTests
 
       - uses: actions/upload-artifact@v4
         with:

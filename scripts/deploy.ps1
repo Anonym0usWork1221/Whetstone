@@ -86,6 +86,27 @@ or run vcvars64.bat first.
 }
 Ok "cl.exe on PATH"
 
+# rustc invokes `link.exe` by name. Git for Windows ships a GNU coreutils
+# `link.exe` in its usr\bin, and if that directory comes first on PATH -- which
+# happens whenever this runs under Git Bash -- rustc calls the wrong program and
+# fails with "extra operand", pages of linker noise, and a misleading suggestion
+# to repair Visual Studio. Catching it here costs one check.
+$link = Get-Command link.exe -ErrorAction SilentlyContinue
+if (-not $link) {
+    Die "link.exe not found. Run from a Developer Command Prompt, or run vcvars64.bat."
+}
+if ($link.Source -match '\\Git\\usr\\bin\\' -or $link.Source -match '\\usr\\bin\\link') {
+    Die @"
+link.exe resolves to Git for Windows' coreutils tool, not MSVC's linker:
+    $($link.Source)
+
+rustc calls link.exe by name and will pick this one up, failing with
+"extra operand". Run this script from PowerShell rather than Git Bash, or
+move the MSVC toolchain ahead of Git's usr\bin on PATH.
+"@
+}
+Ok "link.exe -> $($link.Source)"
+
 $archList = (nvcc --list-gpu-arch) -join " "
 if ($archList -notmatch "compute_$Arch") {
     Die "this nvcc cannot target sm_$Arch. Supported: $archList"

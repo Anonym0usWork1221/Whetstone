@@ -240,6 +240,46 @@ turned out to be wrong — a roofline that omitted `lm_head`, a 32× units error
 If you are about to try "just make the weights 1-bit," the data here will save
 you a week.
 
+### Measured against llama.cpp on the same GPU
+
+Not an estimate — llama.cpp built from source for `sm_75` and run on the same
+RTX 2060 with the same checkpoint (`llama-bench`, 3 repetitions):
+
+| engine | format | bytes/token | decode | prefill | % of its own roofline |
+|---|---|---|---|---|---|
+| HuggingFace | fp16 | 988 MB | 36.8 tok/s | ~4,000 tok/s | 13% |
+| **llama.cpp** | **fp16** | 988 MB | **137.2 tok/s** | 13,452 tok/s | **49%** |
+| **llama.cpp** | **Q4_K_M** | 392 MB | **296.9 tok/s** | 10,539 tok/s | **42%** |
+| Whetstone | int4 `.wstone` | **263 MB** | *no executor yet* | — | ceiling 1,059 |
+
+Three things follow, and none of them flatter this project:
+
+1. **llama.cpp is 8.1x the HuggingFace baseline** on identical hardware. The
+   "~9x of framework overhead" identified above is real — llama.cpp has already
+   collected it. That was never novel headroom; it was the gap between a Python
+   research framework and a competent C++ engine.
+2. **llama.cpp attains 42-49% of the bandwidth roofline.** Whetstone's fp16 GEMV
+   reaches 60-69% in isolation, but an isolated GEMV is not an engine; the gap
+   between those numbers is attention, norms, sampling and scheduling.
+3. **The one real advantage is bytes.** `.wstone` int4 reads 263 MB/token against
+   Q4_K_M's 392 MB — **1.49x fewer**. That is the entire theoretical edge.
+
+So the honest upside: if Whetstone's executor eventually matched llama.cpp's
+roofline attainment, 42% of 1,059 is **~445 tok/s**, or about **1.5x**
+llama.cpp. That is the prize, and claiming it means building a complete engine
+as well-tuned as a project with years of work behind it.
+
+**Reproduce this yourself:**
+
+```bash
+git clone --depth 1 https://github.com/ggml-org/llama.cpp && cd llama.cpp
+cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=75 -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j --target llama-bench llama-quantize
+python convert_hf_to_gguf.py /path/to/Qwen2.5-0.5B-Instruct --outfile f16.gguf --outtype f16
+./build/bin/llama-quantize f16.gguf q4km.gguf Q4_K_M
+./build/bin/llama-bench -m q4km.gguf -m f16.gguf -p 512 -n 128 -ngl 99
+```
+
 ### So what is this for
 
 An experiment in **what actually governs inference speed on cheap hardware**,
@@ -251,7 +291,10 @@ about exotic arithmetic at all:
 > and costs *zero* accuracy — more than quantization, and safer.
 
 That finding is the opposite of where this project started, and it came from
-measuring the baseline instead of assuming it was near-optimal.
+measuring the baseline instead of assuming it was near-optimal. The comparison
+table above shows the humbling half of it: llama.cpp has already banked that 9x.
+The remaining edge is 1.49x fewer bytes per token, and it is unrealised until
+there is an executor.
 
 ---
 
