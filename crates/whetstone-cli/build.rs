@@ -14,8 +14,11 @@ fn main() {
     println!("cargo:rerun-if-env-changed=WHETSTONE_GIT_SHA");
     println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
 
-    let arch = std::env::var("WHETSTONE_CUDA_ARCH").unwrap_or_else(|_| "75".into());
-    println!("cargo:rustc-env=WHETSTONE_CUDA_ARCH={arch}");
+    // NOTE: the architecture list is NOT read here. `WHETSTONE_CUDA_ARCH` is a
+    // *request* ("all", "native", "75,86"), not the list of images that got
+    // built, and a `cargo:rustc-env` emitted by the kernels build script is not
+    // visible to `env!` in this crate anyway. `whetstone-kernels` re-exports the
+    // resolved list as a `pub const`, which is what `--version` prints.
 
     // CI passes the sha explicitly; a local build reads it from git; a tarball
     // has neither and says so.

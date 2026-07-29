@@ -144,6 +144,7 @@ pub fn rope_cache(
     n_q: usize,
     pos0: usize,
     n: usize,
+    qk_norm: Option<crate::decode::QkNorm<'_>>,
 ) -> Result<()> {
     let hd = cache.head_dim;
     let stride = (n_q + 2 * cache.n_kv) * hd;
@@ -165,8 +166,20 @@ pub fn rope_cache(
             cache.max_seq
         )));
     }
-    // SAFETY: geometry, cache capacity and the chunk's position range are all
-    // validated above against the dimensions the kernel indexes.
+    if let Some(qn) = &qk_norm {
+        if qn.q.len() != hd || qn.k.len() != hd {
+            return Err(Error::Shape(format!(
+                "rope_cache_chunk: gains are q[{}], k[{}]; both must be head_dim {hd}",
+                qn.q.len(),
+                qn.k.len()
+            )));
+        }
+    }
+    let (qw, kw, eps) = crate::decode::norm_ptrs(&qk_norm);
+
+    // SAFETY: geometry, cache capacity, the chunk's position range and the two
+    // gain vectors are all validated above against the dimensions the kernel
+    // indexes. Null gain pointers select the no-norm path.
     check(unsafe {
         ffi::wst_rope_cache_chunk(
             qkv.as_mut_ptr(),
@@ -180,6 +193,9 @@ pub fn rope_cache(
             pos0 as i32,
             n as i32,
             cache.max_seq as i32,
+            qw,
+            kw,
+            eps,
         )
     })
 }

@@ -229,7 +229,14 @@ impl Engine {
                 events[e].record()?;
                 e += 1;
 
-                decode::rope_cache(&mut a.qkv, &mut self.caches[l], &self.rope, n_q, &a.pos_dev)?;
+                decode::rope_cache(
+                    &mut a.qkv,
+                    &mut self.caches[l],
+                    &self.rope,
+                    n_q,
+                    &a.pos_dev,
+                    layer.qk_norm(eps),
+                )?;
                 events[e].record()?;
                 e += 1;
 

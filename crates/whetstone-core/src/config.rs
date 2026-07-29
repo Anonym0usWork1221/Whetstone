@@ -61,6 +61,43 @@ pub struct ModelConfig {
     /// RoPE frequency scaling, when the model stretches its context.
     #[serde(default)]
     pub rope_scaling: Option<RopeScalingConfig>,
+
+    // --- mixture of experts -------------------------------------------------
+    //
+    // A MoE `config.json` parses perfectly as a dense one; these fields are the
+    // only thing that distinguishes it. Before they were read, they were
+    // *ignored*, which is why the family whitelist had to refuse MoE by name --
+    // a permissive check would have loaded the model, run one expert's worth of
+    // weights, and generated fluent, wrong text with no shape mismatch to catch
+    // it. Now they are parsed, so the check can be structural.
+    /// Experts per MoE block. `num_local_experts` in the Mixtral spelling.
+    #[serde(default, alias = "num_local_experts")]
+    pub num_experts: Option<usize>,
+    /// Experts the router selects per token. The top-k.
+    #[serde(default)]
+    pub num_experts_per_tok: Option<usize>,
+    /// SwiGLU inner width **of one expert**, which is far smaller than a dense
+    /// `intermediate_size` — 768 against 2048's dense equivalent on
+    /// Qwen3-30B-A3B.
+    #[serde(default)]
+    pub moe_intermediate_size: Option<usize>,
+    /// Whether the top-k router probabilities are renormalised to sum to 1.
+    #[serde(default)]
+    pub norm_topk_prob: Option<bool>,
+}
+
+/// A mixture-of-experts block's geometry, once validated.
+///
+/// Exists so the roofline arithmetic reads the same as the dense case instead of
+/// unwrapping three `Option`s at every call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MoeGeometry {
+    /// Experts stored per block.
+    pub experts: usize,
+    /// Experts read per token. Never greater than `experts`.
+    pub experts_per_tok: usize,
+    /// One expert's SwiGLU inner width.
+    pub intermediate: usize,
 }
 
 /// The `rope_scaling` block, as several families spell it.
@@ -90,7 +127,10 @@ pub struct Architecture {
     pub qkv_bias: bool,
     /// Per-head RMSNorm on q and k before RoPE. Qwen3, Gemma2, OLMo2.
     ///
-    /// **Not implemented.** Recorded so the loader can refuse rather than run.
+    /// Implemented: folded into the RoPE kernels, which already hold the head
+    /// vector two elements per lane. This flag is what the config *claims*; the
+    /// loader trusts the presence of `q_norm`/`k_norm` in the weights instead,
+    /// because that is what decides whether the arithmetic is right.
     pub qk_norm: bool,
 }
 
@@ -186,17 +226,12 @@ impl ModelConfig {
                 self.hidden_act
             )));
         }
-        let arch = self.architecture()?;
-        if arch.qk_norm {
-            return Err(Error::Config(format!(
-                "{:?} applies RMSNorm to the query and key head vectors before \
-                 RoPE (QK-norm), which Whetstone's attention does not implement.\n\
-                 The layer topology otherwise matches, so this would load and run \
-                 and generate fluent text that is quantitatively wrong -- which is \
-                 why it is refused instead.",
-                self.model_type
-            )));
-        }
+        // QK-norm used to be refused here. It is implemented now -- the per-head
+        // RMSNorm is folded into the RoPE kernels, which already hold the head
+        // vector in registers. The *presence* of the gain tensors is still what
+        // decides whether it runs, checked at load, so a checkpoint whose config
+        // and weights disagree is an error rather than a silent skip.
+        let _ = self.architecture()?;
         if let Some(rs) = &self.rope_scaling {
             let t = rs.rope_type.as_str();
             if !matches!(t, "" | "default" | "llama3") {
@@ -237,9 +272,53 @@ impl ModelConfig {
         q + k + v + o
     }
 
-    /// MLP weight count in one block: gate, up and down projections.
+    /// MLP weight count **read per token** in one block.
+    ///
+    /// For a dense block that is gate, up and down. For a mixture-of-experts
+    /// block it is the same three matrices times `num_experts_per_tok`, at the
+    /// expert width — because at batch 1 only the routed experts are read, which
+    /// is the entire reason MoE is interesting to a bandwidth-bound engine.
+    /// The router itself (`[n_experts, hidden]`) is added: it is small but it is
+    /// read every token, and this project has been burned by leaving a
+    /// read-every-token matrix out of the denominator before (§2.2).
     pub fn mlp_params_per_layer(&self) -> usize {
-        3 * self.hidden_size * self.intermediate_size
+        match self.moe() {
+            Some(m) => 3 * self.hidden_size * m.intermediate * m.experts_per_tok
+                + self.hidden_size * m.experts,
+            None => 3 * self.hidden_size * self.intermediate_size,
+        }
+    }
+
+    /// MLP weight count **stored** in one block. Differs from
+    /// [`ModelConfig::mlp_params_per_layer`] only for MoE, and by a lot: a
+    /// 128-expert top-8 layer stores sixteen times what it reads.
+    pub fn mlp_stored_params_per_layer(&self) -> usize {
+        match self.moe() {
+            Some(m) => 3 * self.hidden_size * m.intermediate * m.experts
+                + self.hidden_size * m.experts,
+            None => 3 * self.hidden_size * self.intermediate_size,
+        }
+    }
+
+    /// The mixture-of-experts geometry, if this is one.
+    ///
+    /// `num_experts_per_tok` and an expert count are what distinguish a MoE
+    /// config from a dense one; both must be present and non-zero, because a
+    /// config carrying one without the other is not something to guess about.
+    pub fn moe(&self) -> Option<MoeGeometry> {
+        let experts = self.num_experts?;
+        let per_tok = self.num_experts_per_tok?;
+        if experts == 0 || per_tok == 0 {
+            return None;
+        }
+        Some(MoeGeometry {
+            experts,
+            // Top-k cannot exceed the pool. A config that says otherwise is
+            // malformed, and clamping keeps the roofline honest rather than
+            // reporting more traffic than the model can possibly read.
+            experts_per_tok: per_tok.min(experts),
+            intermediate: self.moe_intermediate_size.unwrap_or(self.intermediate_size),
+        })
     }
 
     /// Total weight count in one block.
@@ -288,9 +367,29 @@ impl ModelConfig {
     }
 
     /// Every stored parameter, counting `lm_head` only when it is untied.
+    ///
+    /// For a MoE model this is the number in the model's *name* — 30.5 B for
+    /// Qwen3-30B-A3B — and it is **not** the roofline denominator. See
+    /// [`ModelConfig::decode_resident_params`], which is the 3.3 B.
     pub fn total_params(&self) -> usize {
         let extra = if self.tie_word_embeddings { 0 } else { self.embedding_params() };
-        self.non_embedding_params() + self.embedding_params() + extra
+        let blocks = self.num_hidden_layers
+            * (self.attn_params_per_layer() + self.mlp_stored_params_per_layer());
+        blocks + self.embedding_params() + extra
+    }
+
+    /// Stored parameters divided by parameters read per token.
+    ///
+    /// 1.0 for a dense model. For a MoE model it is the whole point: knowledge
+    /// held per byte of bandwidth spent. It is also the factor by which the
+    /// weights overflow VRAM, so it is exactly as much a warning as a feature —
+    /// a 9× ratio on a 6 GB card means 8/9 of the model is somewhere slower.
+    pub fn sparsity_ratio(&self) -> f64 {
+        let read = self.decode_resident_params();
+        if read == 0 {
+            return 1.0;
+        }
+        self.total_params() as f64 / read as f64
     }
 
     /// Fraction of per-block weights belonging to the MLP.
@@ -507,10 +606,22 @@ mod tests {
             assert!(e.contains("unsupported model_type"), "{fam}: {e}");
         }
 
-        // Qwen3 passes the family check and is refused a step later, on QK-norm.
+        // Qwen3 used to be refused here on QK-norm. It is implemented now: the
+        // per-head RMSNorm is folded into the RoPE kernels. What still has to
+        // hold is that the config *declares* it, so the loader knows to expect
+        // the gain tensors -- a checkpoint whose weights and config disagree is
+        // caught at load, where the weights are visible.
         let c: ModelConfig = serde_json::from_value(llama_shaped_config("qwen3")).unwrap();
-        let e = c.validate().expect_err("qwen3 must be refused").to_string();
-        assert!(e.contains("QK-norm"), "{e}");
+        c.validate().expect("qwen3 is supported now");
+        assert!(c.architecture().unwrap().qk_norm, "qwen3 must declare qk_norm");
+        assert!(
+            !serde_json::from_value::<ModelConfig>(llama_shaped_config("llama"))
+                .unwrap()
+                .architecture()
+                .unwrap()
+                .qk_norm,
+            "llama must not declare qk_norm"
+        );
     }
 
     #[test]

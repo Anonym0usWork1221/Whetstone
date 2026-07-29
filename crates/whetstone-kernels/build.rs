@@ -7,24 +7,70 @@
 //! `nvcc -dlink` step that RDC then requires. Whetstone has no cross-TU device
 //! calls, so plain whole-program compilation is both correct and faster.
 //!
-//! We compile for a single architecture on purpose. Multi-arch fat binaries
-//! multiply build time, and these kernels are written against capabilities that
-//! differ by architecture (`bmma.xor.popc` is sm_75+, `cp.async` is sm_80+), so
-//! a "portable" build would be a fiction.
+//! # Fat binary, and why the arch gating had to change first
 //!
-//! Override with `WHETSTONE_CUDA_ARCH=86 cargo build`.
+//! Whetstone used to compile for exactly one architecture, on the argument that
+//! the kernels are written against capabilities that differ by architecture
+//! (`bmma.xor.popc` is sm_75+, `cp.async` is sm_80+) so a portable build would
+//! be a fiction. That argument was wrong about its own code: **only `probe.cu`
+//! ever used a tensor-core instruction.** The shipped decode and chunk kernels
+//! are `half2` arithmetic, which every card since sm_53 has.
+//!
+//! So the build emits one SASS image per architecture plus a **PTX tail** at the
+//! highest one, which the driver JITs onto anything newer than this toolkit
+//! knows about. One archive covers Pascal through Hopper and forward.
+//!
+//! The gating moved with it (`common.cuh`): device code keys off
+//! `__CUDA_ARCH__`, which nvcc redefines per compilation pass, and host code
+//! asks the driver at run time. A `-D` from here can answer neither question in
+//! a fat binary.
+//!
+//! ## `WHETSTONE_CUDA_ARCH`
+//!
+//! | value | meaning |
+//! |---|---|
+//! | unset / `all` | every architecture this toolkit supports, plus PTX. The release build. |
+//! | `native` | just the installed GPU's. **Use this while iterating** — it is ~7× less device compilation. |
+//! | `75` or `75,86` | exactly these |
+//!
+//! Build time is the real cost of `all`: each `.cu` is compiled once per
+//! architecture. That is why `native` exists and why the chosen list is printed.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const DEFAULT_ARCH: &str = "75"; // Turing. bmma.xor.popc lives here.
+/// Architectures worth an image, newest last.
+///
+/// Anything this toolkit does not know is dropped rather than failing the
+/// build, so a CUDA 12.0 install produces a Pascal-through-Hopper archive and a
+/// CUDA 12.8 install additionally produces Blackwell — from the same source.
+///
+/// The floor is **sm_60**. Below that `half2` arithmetic is emulated, which
+/// would make the one thing this engine is built around (packed fp16 GEMV)
+/// slower than fp32, and reporting a working-but-pointless build as support
+/// would be the same class of lie the architecture whitelist exists to prevent.
+const WANTED_ARCHES: &[u32] = &[
+    60,  // Pascal: P100
+    61,  // Pascal: GTX 10xx, Titan Xp
+    70,  // Volta: V100
+    75,  // Turing: RTX 20xx, GTX 16xx, T4  <- the development card
+    80,  // Ampere: A100
+    86,  // Ampere: RTX 30xx, A10
+    89,  // Ada: RTX 40xx, L4
+    90,  // Hopper: H100
+    100, // Blackwell datacentre: B100/B200   (CUDA 12.8+)
+    120, // Blackwell consumer: RTX 50xx      (CUDA 12.8+)
+];
+
+/// Used when no GPU is present and no list was given. Turing, the card every
+/// measurement in `research/` was taken on.
+const FALLBACK_ARCH: u32 = 75;
 
 fn main() {
     println!("cargo:rerun-if-changed=cuda");
     println!("cargo:rerun-if-env-changed=WHETSTONE_CUDA_ARCH");
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
 
-    let arch = std::env::var("WHETSTONE_CUDA_ARCH").unwrap_or_else(|_| DEFAULT_ARCH.into());
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR not set"));
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let is_windows = target_os == "windows";
@@ -47,6 +93,20 @@ fn main() {
         );
     }
 
+    let arches = select_arches(&nvcc);
+    let gencode = gencode_flags(&arches);
+    println!(
+        "cargo:warning=whetstone: building device code for sm_{} + PTX {}",
+        arches.iter().map(u32::to_string).collect::<Vec<_>>().join(", sm_"),
+        arches.last().unwrap()
+    );
+    // Consumed by `whetstone --version` and `whetstone doctor`, so a user can
+    // see which images their binary actually carries.
+    println!(
+        "cargo:rustc-env=WHETSTONE_CUDA_ARCH_LIST={}",
+        arches.iter().map(u32::to_string).collect::<Vec<_>>().join(",")
+    );
+
     let sources = collect_cu(Path::new("cuda"));
     assert!(!sources.is_empty(), "no .cu sources found under cuda/");
 
@@ -66,7 +126,7 @@ fn main() {
             .arg(src)
             .arg("-o")
             .arg(&obj)
-            .arg(format!("-arch=sm_{arch}"))
+            .args(&gencode)
             .arg("-O3")
             .arg("-std=c++17")
             .arg("--use_fast_math") // maps expf/rsqrtf to the hardware SFU paths
@@ -80,7 +140,9 @@ fn main() {
             .arg("-Xptxas=-v") // register/smem usage lands in the build log
             .arg("--expt-relaxed-constexpr")
             .arg("-Icuda")
-            .arg(format!("-DWHETSTONE_ARCH={arch}"));
+            // The *lowest* image in the archive. Reporting only -- device code
+            // gates on __CUDA_ARCH__ and host code asks the driver.
+            .arg(format!("-DWHETSTONE_ARCH={}", arches[0]));
 
         // Host-compiler flags are not portable: -fPIC and -O3 are GCC/Clang
         // spellings that MSVC rejects outright.
@@ -137,6 +199,135 @@ fn main() {
     if !is_windows {
         println!("cargo:rustc-link-lib=dylib=stdc++");
     }
+}
+
+/// Architectures to emit images for, ascending. Never empty.
+fn select_arches(nvcc: &Path) -> Vec<u32> {
+    let supported = toolkit_arches(nvcc);
+    let request = std::env::var("WHETSTONE_CUDA_ARCH").unwrap_or_else(|_| "all".into());
+
+    // A toolkit that cannot be interrogated must not silently produce a
+    // single-architecture archive from the path documented as "the release
+    // build". Failing loudly is the only honest option: the alternative ships
+    // something whose `--version` says sm_75 and whose users on every other card
+    // get a launch failure.
+    if request.trim() == "all" || request.trim().is_empty() {
+        assert!(
+            !supported.is_empty(),
+            "`nvcc --list-gpu-arch` produced nothing, so the set of architectures \
+             this toolkit can target is unknown. Refusing to guess and emit a \
+             single-arch archive from the release path. Set WHETSTONE_CUDA_ARCH \
+             explicitly (e.g. =75, or =native) if this toolkit genuinely cannot \
+             list its architectures."
+        );
+    }
+
+    let mut chosen: Vec<u32> = match request.trim() {
+        "all" | "" => WANTED_ARCHES.iter().copied().filter(|a| supported.contains(a)).collect(),
+        // A card newer than the toolkit is a real configuration (an RTX 50xx on
+        // CUDA 12.0), and the right answer there is the newest image the toolkit
+        // *can* build plus the PTX tail, which the driver JITs. Asserting would
+        // make the documented iteration path unusable on exactly the machines
+        // that most need it.
+        "native" => {
+            let want = detect_installed_arch().unwrap_or(FALLBACK_ARCH);
+            let pick = if supported.is_empty() || supported.contains(&want) {
+                want
+            } else {
+                let top = supported.iter().copied().filter(|&a| a < want).max();
+                let fallback = top.unwrap_or(FALLBACK_ARCH);
+                println!(
+                    "cargo:warning=whetstone: this GPU is sm_{want}, newer than any \
+                     image this CUDA toolkit can build; using sm_{fallback} plus the \
+                     PTX tail, which the driver will JIT."
+                );
+                fallback
+            };
+            vec![pick]
+        }
+        list => list
+            .split(',')
+            .filter_map(|t| t.trim().parse::<u32>().ok())
+            .collect(),
+    };
+
+    chosen.sort_unstable();
+    chosen.dedup();
+
+    // An explicit request for something the toolkit cannot build has to fail
+    // loudly. Silently dropping it would produce an archive missing exactly the
+    // architecture the user asked for, which they would discover as a launch
+    // failure on the target machine.
+    // Only an *explicit list* is asserted against. "all" filters, and "native"
+    // clamps with a warning; neither is a request for a specific architecture.
+    let explicit = !matches!(request.trim(), "all" | "" | "native");
+    if explicit && !supported.is_empty() {
+        for a in &chosen {
+            assert!(
+                supported.contains(a),
+                "WHETSTONE_CUDA_ARCH asks for sm_{a}, which this CUDA toolkit \
+                 cannot target. It supports: {}",
+                supported.iter().map(u32::to_string).collect::<Vec<_>>().join(", ")
+            );
+        }
+    }
+
+    if chosen.is_empty() {
+        chosen.push(FALLBACK_ARCH);
+    }
+    chosen
+}
+
+/// `-gencode` for each architecture, plus a PTX tail at the highest.
+///
+/// The PTX is what makes the archive forward-compatible: a card newer than this
+/// toolkit has no SASS image, so the driver JITs the PTX at first launch. It
+/// costs one extra compilation and a few MB, and it is the difference between
+/// "runs on GPUs released after this build" and "fails to launch".
+fn gencode_flags(arches: &[u32]) -> Vec<String> {
+    let mut out: Vec<String> = arches
+        .iter()
+        .map(|a| format!("-gencode=arch=compute_{a},code=sm_{a}"))
+        .collect();
+    let top = arches.last().copied().unwrap_or(FALLBACK_ARCH);
+    out.push(format!("-gencode=arch=compute_{top},code=compute_{top}"));
+    out
+}
+
+/// Architectures this toolkit can target, from `nvcc --list-gpu-arch`.
+///
+/// Asked rather than assumed: CUDA 12.0 stops at sm_90 and CUDA 12.8 adds
+/// Blackwell, and hardcoding either would break the other.
+fn toolkit_arches(nvcc: &Path) -> Vec<u32> {
+    let Ok(out) = Command::new(nvcc).arg("--list-gpu-arch").output() else {
+        return Vec::new();
+    };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("compute_")?.parse::<u32>().ok())
+        .collect()
+}
+
+/// The installed GPU's compute capability as `major*10 + minor`.
+///
+/// `nvidia-smi` rather than a CUDA API call, because a build script must not
+/// need a working driver context -- and on a machine with several cards this
+/// takes the first, which is what a `native` build means.
+fn detect_installed_arch() -> Option<u32> {
+    let out = Command::new("nvidia-smi")
+        .args(["--query-gpu=compute_cap", "--format=csv,noheader"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let first = text.lines().next()?.trim();
+    let (major, minor) = first.split_once('.')?;
+    Some(major.trim().parse::<u32>().ok()? * 10 + minor.trim().parse::<u32>().ok()?)
 }
 
 fn collect_cu(dir: &Path) -> Vec<PathBuf> {

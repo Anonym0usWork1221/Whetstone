@@ -22,12 +22,19 @@
 #include <mma.h>
 #include <cuda_fp16.h>
 
+/* `mma.h` only declares `nvcuda` when the pass can actually use tensor cores --
+ * its own guard is exactly this condition. Importing it unconditionally breaks
+ * the sm_60 and sm_61 passes of the fat binary with "name must be a namespace
+ * name", which is a confusing way to be told the architecture has no wmma. */
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 700
 using namespace nvcuda;
+#endif
 
 /* ------------------------------------------------------------ fp16 baseline */
 
 __global__ void probe_hmma(const half *__restrict__ A, const half *__restrict__ B,
                            float *__restrict__ C, int iters) {
+#if WST_DEV_HAS_WMMA
   wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a;
   wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> b;
   wmma::fragment<wmma::accumulator, 16, 16, 16, float> c;
@@ -36,13 +43,19 @@ __global__ void probe_hmma(const half *__restrict__ A, const half *__restrict__ 
   wmma::load_matrix_sync(b, B, 16);
   for (int i = 0; i < iters; ++i) wmma::mma_sync(c, a, b, c);
   wmma::store_matrix_sync(C, c, 16, wmma::mem_row_major);
+#else
+  (void)A; (void)B; (void)C; (void)iters;
+#endif
 }
 
 /* ------------------------------------------------------------------- int8 */
 
-#if WST_ARCH_HAS_IMMA
+/* The symbol exists on every architecture; the body does not. A kernel that is
+ * `#if`-ed away entirely cannot be launched from host code that is compiled
+ * once for all of them. */
 __global__ void probe_imma8(const int8_t *__restrict__ A, const int8_t *__restrict__ B,
                             int32_t *__restrict__ C, int iters) {
+#if WST_DEV_HAS_IMMA
   wmma::fragment<wmma::matrix_a, 16, 16, 16, int8_t, wmma::row_major> a;
   wmma::fragment<wmma::matrix_b, 16, 16, 16, int8_t, wmma::col_major> b;
   wmma::fragment<wmma::accumulator, 16, 16, 16, int32_t> c;
@@ -51,14 +64,16 @@ __global__ void probe_imma8(const int8_t *__restrict__ A, const int8_t *__restri
   wmma::load_matrix_sync(b, B, 16);
   for (int i = 0; i < iters; ++i) wmma::mma_sync(c, a, b, c);
   wmma::store_matrix_sync(C, c, 16, wmma::mem_row_major);
-}
+#else
+  (void)A; (void)B; (void)C; (void)iters;
 #endif
+}
 
 /* ------------------------------------------------------------------- int4 */
 
-#if WST_ARCH_HAS_BMMA_XOR
 __global__ void probe_imma4(const uint32_t *__restrict__ A, const uint32_t *__restrict__ B,
                             int32_t *__restrict__ C, int iters) {
+#if WST_DEV_HAS_BMMA_XOR
   using s4 = wmma::experimental::precision::s4;
   wmma::fragment<wmma::matrix_a, 8, 8, 32, s4, wmma::row_major> a;
   wmma::fragment<wmma::matrix_b, 8, 8, 32, s4, wmma::col_major> b;
@@ -68,6 +83,9 @@ __global__ void probe_imma4(const uint32_t *__restrict__ A, const uint32_t *__re
   wmma::load_matrix_sync(b, (const s4 *)B, 32);
   for (int i = 0; i < iters; ++i) wmma::mma_sync(c, a, b, c);
   wmma::store_matrix_sync(C, c, 8, wmma::mem_row_major);
+#else
+  (void)A; (void)B; (void)C; (void)iters;
+#endif
 }
 
 /* --------------------------------------------------------- binary (1 bit) */
@@ -79,6 +97,7 @@ __global__ void probe_imma4(const uint32_t *__restrict__ A, const uint32_t *__re
  * sm_80, which is why Whetstone's binary encoding is built around XOR. */
 __global__ void probe_bmma(const uint32_t *__restrict__ A, const uint32_t *__restrict__ B,
                            int32_t *__restrict__ C, int iters) {
+#if WST_DEV_HAS_BMMA_XOR
   using b1 = wmma::experimental::precision::b1;
   wmma::fragment<wmma::matrix_a, 8, 8, 128, b1, wmma::row_major> a;
   wmma::fragment<wmma::matrix_b, 8, 8, 128, b1, wmma::col_major> b;
@@ -90,17 +109,25 @@ __global__ void probe_bmma(const uint32_t *__restrict__ A, const uint32_t *__res
     wmma::bmma_sync(c, a, b, c, wmma::experimental::bmmaBitOpXOR,
                     wmma::experimental::bmmaAccumulateOpPOPC);
   wmma::store_matrix_sync(C, c, 8, wmma::mem_row_major);
+#else
+  (void)A; (void)B; (void)C; (void)iters;
+#endif
 }
-#endif /* WST_ARCH_HAS_BMMA_XOR */
 
 /* ----------------------------------------------------- CUDA-core fallbacks */
 
+/* `__dp4a` is sm_61+. P100 (sm_60) is the one architecture in the fat binary
+ * without it. */
 __global__ void probe_dp4a(const int32_t *__restrict__ A, const int32_t *__restrict__ B,
                            int32_t *__restrict__ C, int iters) {
+#if WST_DEV_HAS_DP4A
   int acc = 0;
   int a = A[threadIdx.x & 31], b = B[threadIdx.x & 31];
   for (int i = 0; i < iters; ++i) acc = __dp4a(a, b, acc);
   if (threadIdx.x == 0) C[blockIdx.x] = acc;
+#else
+  (void)A; (void)B; (void)C; (void)iters;
+#endif
 }
 
 __global__ void probe_popc(const uint32_t *__restrict__ A, const uint32_t *__restrict__ B,
@@ -109,6 +136,33 @@ __global__ void probe_popc(const uint32_t *__restrict__ A, const uint32_t *__res
   uint32_t a = A[threadIdx.x & 31], b = B[threadIdx.x & 31];
   for (int i = 0; i < iters; ++i) acc += __popc(a ^ b);
   if (threadIdx.x == 0) C[blockIdx.x] = acc;
+}
+
+/* ------------------------------------------- what the loaded IMAGE contains */
+
+/* The device's compute capability and the *image* the driver loaded for it are
+ * two different facts, and the fat binary made them diverge.
+ *
+ * `WST_HOST_HAS_*` asks the driver what the installed card can do.
+ * `WST_DEV_HAS_*` was resolved at compile time, once per architecture, and
+ * decides whether a kernel body exists at all. They agree only when the archive
+ * happens to hold an exact image for the running device.
+ *
+ * When it does not -- an sm_72 card running the sm_70 image, or any card
+ * running a `WHETSTONE_CUDA_ARCH=70` build -- the host sees "this device has
+ * IMMA", launches a kernel whose body was `#if`-ed away to nothing, gets a
+ * clean `cudaGetLastError()`, and `measure_tops` divides real work-units by
+ * pure launch overhead. The result is a **fabricated throughput number**, which
+ * is precisely the failure mode this project exists to not have.
+ *
+ * So the image reports itself. A capability is usable only when the device
+ * supports it AND the loaded image contains it. */
+__global__ void probe_image_caps(int32_t *__restrict__ out) {
+  if (threadIdx.x != 0) return;
+  out[0] = WST_DEV_HAS_WMMA ? 1 : 0;
+  out[1] = WST_DEV_HAS_IMMA ? 1 : 0;
+  out[2] = WST_DEV_HAS_BMMA_XOR ? 1 : 0;
+  out[3] = WST_DEV_HAS_DP4A ? 1 : 0;
 }
 
 /* --------------------------------------------------- XNOR identity check */
@@ -232,44 +286,72 @@ extern "C" wst_status_t wst_probe(wst_probe_t *out, int32_t iters) {
 
   bool sup = false;
 
-  out->fp16_wmma_tflops = measure_tops(ctx, kMacsWmma16, [&] {
-    probe_hmma<<<ctx.blocks, ctx.threads>>>((const half *)dA, (const half *)dB,
-                                            (float *)dC, ctx.iters);
-  }, &sup);
-  if (!sup) out->fp16_wmma_tflops = -1.0;
+  /* What the *image* holds, as opposed to what the device could run. */
+  int32_t img[4] = {0, 0, 0, 0};
+  {
+    int32_t *d_caps = nullptr;
+    if (wst_malloc((void **)&d_caps, sizeof(img)) == WST_OK) {
+      probe_image_caps<<<1, 1>>>(d_caps);
+      if (cudaDeviceSynchronize() == cudaSuccess) {
+        cudaMemcpy(img, d_caps, sizeof(img), cudaMemcpyDeviceToHost);
+      }
+      wst_free(d_caps);
+    }
+  }
+  const bool has_wmma = WST_HOST_HAS_WMMA && img[0];
+  const bool has_imma = WST_HOST_HAS_IMMA && img[1];
+  const bool has_bmma = WST_HOST_HAS_BMMA_XOR && img[2];
+  const bool has_dp4a = WST_HOST_HAS_DP4A && img[3];
 
-#if WST_ARCH_HAS_IMMA
-  out->int8_wmma_tops = measure_tops(ctx, kMacsWmma16, [&] {
-    probe_imma8<<<ctx.blocks, ctx.threads>>>((const int8_t *)dA, (const int8_t *)dB,
-                                             (int32_t *)dC, ctx.iters);
-  }, &sup);
-  if (!sup) out->int8_wmma_tops = -1.0;
-#else
-  out->int8_wmma_tops = -1.0;
-#endif
+  if (has_wmma) {
+    out->fp16_wmma_tflops = measure_tops(ctx, kMacsWmma16, [&] {
+      probe_hmma<<<ctx.blocks, ctx.threads>>>((const half *)dA, (const half *)dB,
+                                              (float *)dC, ctx.iters);
+    }, &sup);
+    if (!sup) out->fp16_wmma_tflops = -1.0;
+  } else {
+    out->fp16_wmma_tflops = -1.0;
+  }
 
-#if WST_ARCH_HAS_BMMA_XOR
-  out->int4_wmma_tops = measure_tops(ctx, kMacsImma4, [&] {
-    probe_imma4<<<ctx.blocks, ctx.threads>>>((const uint32_t *)dA, (const uint32_t *)dB,
-                                             (int32_t *)dC, ctx.iters);
-  }, &sup);
-  if (!sup) out->int4_wmma_tops = -1.0;
+  /* Runtime, not `#if`: this host code is compiled once and runs against
+   * whatever card is installed, which the build did not know. -1 means "this
+   * device cannot do it", and is reported as such rather than as a zero. */
+  if (has_imma) {
+    out->int8_wmma_tops = measure_tops(ctx, kMacsWmma16, [&] {
+      probe_imma8<<<ctx.blocks, ctx.threads>>>((const int8_t *)dA, (const int8_t *)dB,
+                                               (int32_t *)dC, ctx.iters);
+    }, &sup);
+    if (!sup) out->int8_wmma_tops = -1.0;
+  } else {
+    out->int8_wmma_tops = -1.0;
+  }
 
-  out->bin_bmma_tops = measure_tops(ctx, kMacsBmma, [&] {
-    probe_bmma<<<ctx.blocks, ctx.threads>>>((const uint32_t *)dA, (const uint32_t *)dB,
-                                            (int32_t *)dC, ctx.iters);
-  }, &sup);
-  if (!sup) out->bin_bmma_tops = -1.0;
-#else
-  out->int4_wmma_tops = -1.0;
-  out->bin_bmma_tops = -1.0;
-#endif
+  if (has_bmma) {
+    out->int4_wmma_tops = measure_tops(ctx, kMacsImma4, [&] {
+      probe_imma4<<<ctx.blocks, ctx.threads>>>((const uint32_t *)dA, (const uint32_t *)dB,
+                                               (int32_t *)dC, ctx.iters);
+    }, &sup);
+    if (!sup) out->int4_wmma_tops = -1.0;
 
-  out->dp4a_tops = measure_tops(ctx, kMacsDp4a, [&] {
-    probe_dp4a<<<ctx.blocks, ctx.threads>>>((const int32_t *)dA, (const int32_t *)dB,
-                                            (int32_t *)dC, ctx.iters);
-  }, &sup);
-  if (!sup) out->dp4a_tops = -1.0;
+    out->bin_bmma_tops = measure_tops(ctx, kMacsBmma, [&] {
+      probe_bmma<<<ctx.blocks, ctx.threads>>>((const uint32_t *)dA, (const uint32_t *)dB,
+                                              (int32_t *)dC, ctx.iters);
+    }, &sup);
+    if (!sup) out->bin_bmma_tops = -1.0;
+  } else {
+    out->int4_wmma_tops = -1.0;
+    out->bin_bmma_tops = -1.0;
+  }
+
+  if (has_dp4a) {
+    out->dp4a_tops = measure_tops(ctx, kMacsDp4a, [&] {
+      probe_dp4a<<<ctx.blocks, ctx.threads>>>((const int32_t *)dA, (const int32_t *)dB,
+                                              (int32_t *)dC, ctx.iters);
+    }, &sup);
+    if (!sup) out->dp4a_tops = -1.0;
+  } else {
+    out->dp4a_tops = -1.0;
+  }
 
   out->popc_tops = measure_tops(ctx, kMacsPopc, [&] {
     probe_popc<<<ctx.blocks, ctx.threads>>>((const uint32_t *)dA, (const uint32_t *)dB,

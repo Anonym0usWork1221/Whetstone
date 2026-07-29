@@ -63,11 +63,16 @@ pub fn run(iters: i32, bandwidth_mib: usize) -> Result<()> {
         ("dp4a (CUDA core)", p.dp4a_tops),
         ("popc (CUDA core)", p.popc_tops),
     ];
+    // `base` is -1.0 on any card without fp16 tensor cores (sm_60/sm_61, both
+    // inside the fat binary's supported set). Dividing by it printed a *negative*
+    // ratio next to a perfectly real measurement, which reads as a measurement.
     for (name, v) in rows {
         if v <= 0.0 {
             println!("  {name:<22} {:>12} {:>12}", "-", "unsupported");
-        } else {
+        } else if base > 0.0 {
             println!("  {name:<22} {v:>12.1} {:>11.2}x", v / base);
+        } else {
+            println!("  {name:<22} {v:>12.1} {:>12}", "n/a");
         }
     }
 

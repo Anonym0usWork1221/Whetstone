@@ -39,13 +39,59 @@
 
 #![deny(missing_docs)]
 
+pub mod cpu;
 pub mod format;
 pub mod hier;
 
 use half::f16;
+use rayon::prelude::*;
 
 pub use format::{Header, TensorEntry, TensorKind, Writer};
-pub use hier::{dequantize_int4_hier, quantize_int4_hier, PackedInt4Hier, HGROUP};
+pub use hier::{
+    dequantize_int4_hier, quantize_int4_hier, quantize_int4_hier_measured, PackedInt4Hier, HGROUP,
+};
+
+/// Running `‖w − ŵ‖²` and `‖w‖²`, accumulated while a matrix is packed.
+///
+/// Exists so weight error costs nothing. The obvious implementation —
+/// dequantize the packed matrix and call [`relative_error`] on the pair — needs
+/// a full f32 reconstruction of every tensor and two extra passes over it. Over
+/// a 7 B checkpoint that is roughly 15 GB of transient allocation spent
+/// recomputing a number the packer already held: at the instant `q` is chosen,
+/// `q·scale + min` *is* the reconstruction.
+///
+/// Splittable and mergeable, so a parallel pack reduces over it.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ErrorAccum {
+    num: f64,
+    den: f64,
+}
+
+impl ErrorAccum {
+    /// Accumulates one weight and the value the kernel will reconstruct for it.
+    #[inline]
+    pub fn push(&mut self, original: f32, reconstructed: f32) {
+        let d = (original - reconstructed) as f64;
+        self.num += d * d;
+        self.den += (original as f64) * (original as f64);
+    }
+
+    /// Combines two partial accumulations. Associative, so the reduction order a
+    /// work-stealing pool happens to pick does not change the result beyond f64
+    /// rounding.
+    pub fn merge(a: Self, b: Self) -> Self {
+        Self { num: a.num + b.num, den: a.den + b.den }
+    }
+
+    /// Relative Frobenius error `‖w − ŵ‖ / ‖w‖`, or 0 for an all-zero matrix.
+    pub fn relative(&self) -> f64 {
+        if self.den == 0.0 {
+            0.0
+        } else {
+            (self.num / self.den).sqrt()
+        }
+    }
+}
 
 /// Errors from quantization and the `.wstone` container.
 #[derive(Debug, thiserror::Error)]
@@ -121,6 +167,16 @@ impl PackedInt4 {
 /// full-precision scales and then storing rounded ones introduces an error the
 /// dequantizer cannot undo.
 pub fn quantize_int4_g128(w: &[f32], in_features: usize, out_features: usize) -> Result<PackedInt4> {
+    quantize_int4_g128_measured(w, in_features, out_features).map(|(p, _)| p)
+}
+
+/// [`quantize_int4_g128`], plus the relative Frobenius weight error accumulated
+/// during packing. See [`ErrorAccum`] for why it is not measured afterwards.
+pub fn quantize_int4_g128_measured(
+    w: &[f32],
+    in_features: usize,
+    out_features: usize,
+) -> Result<(PackedInt4, f64)> {
     if in_features % GROUP != 0 {
         return Err(Error::Shape(format!(
             "in_features {in_features} must be a multiple of {GROUP}"
@@ -135,40 +191,61 @@ pub fn quantize_int4_g128(w: &[f32], in_features: usize, out_features: usize) ->
     }
 
     let groups = in_features / GROUP;
-    let mut qw = vec![0u32; out_features * in_features / 8];
+    let words = in_features / 8;
+    let mut qw = vec![0u32; out_features * words];
     let mut sz = vec![0u32; out_features * groups];
 
-    for r in 0..out_features {
-        for g in 0..groups {
-            let base = r * in_features + g * GROUP;
-            let slice = &w[base..base + GROUP];
+    // Rows own disjoint output slices, so the fan-out is synchronisation-free.
+    let acc = qw
+        .par_chunks_mut(words)
+        .zip(sz.par_chunks_mut(groups))
+        .zip(w.par_chunks(in_features))
+        .map(|((qw_row, sz_row), row)| pack_row_g128(row, groups, qw_row, sz_row))
+        .reduce(ErrorAccum::default, ErrorAccum::merge);
 
-            let lo = slice.iter().copied().fold(f32::INFINITY, f32::min);
-            let hi = slice.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    Ok((PackedInt4 { qw, sz, in_features, out_features }, acc.relative()))
+}
 
-            let mut scale = (hi - lo) / QMAX;
-            if !scale.is_finite() || scale == 0.0 {
-                scale = 1.0; // constant group: every value maps to the zero point
-            }
-            let zero = (-lo / scale).round();
+#[inline(always)]
+fn pack_row_g128_body(row: &[f32], groups: usize, qw_row: &mut [u32], sz_row: &mut [u32]) -> ErrorAccum {
+    let mut acc = ErrorAccum::default();
+    for (g, sz) in sz_row.iter_mut().enumerate().take(groups) {
+        let slice = &row[g * GROUP..(g + 1) * GROUP];
 
-            // Round the metadata first: these are the values the kernel sees.
-            let sh = f16::from_f32(scale);
-            let zh = f16::from_f32(zero);
-            sz[r * groups + g] = (sh.to_bits() as u32) | ((zh.to_bits() as u32) << 16);
+        let lo = slice.iter().copied().fold(f32::INFINITY, f32::min);
+        let hi = slice.iter().copied().fold(f32::NEG_INFINITY, f32::max);
 
-            let scale_r = sh.to_f32();
-            let zero_r = zh.to_f32();
+        let mut scale = (hi - lo) / QMAX;
+        if !scale.is_finite() || scale == 0.0 {
+            scale = 1.0; // constant group: every value maps to the zero point
+        }
+        let zero = (-lo / scale).round();
 
-            for (i, &v) in slice.iter().enumerate() {
-                let q = ((v / scale_r).round() + zero_r).clamp(0.0, QMAX) as u32;
-                let col = g * GROUP + i;
-                qw[r * (in_features / 8) + col / 8] |= q << (4 * (col % 8));
-            }
+        // Round the metadata first: these are the values the kernel sees.
+        let sh = f16::from_f32(scale);
+        let zh = f16::from_f32(zero);
+        *sz = (sh.to_bits() as u32) | ((zh.to_bits() as u32) << 16);
+
+        let scale_r = sh.to_f32();
+        let zero_r = zh.to_f32();
+
+        for (i, &v) in slice.iter().enumerate() {
+            let q = ((v / scale_r).round() + zero_r).clamp(0.0, QMAX);
+            let col = g * GROUP + i;
+            qw_row[col / 8] |= (q as u32) << (4 * (col % 8));
+            acc.push(v, (q - zero_r) * scale_r);
         }
     }
+    acc
+}
 
-    Ok(PackedInt4 { qw, sz, in_features, out_features })
+crate::isa_dispatch! {
+    body  = pack_row_g128_body,
+    avx2  = pack_row_g128_avx2,
+    sse41 = pack_row_g128_sse41;
+    /// [`pack_row_g128_body`], compiled per instruction set and selected at run
+    /// time. See [`cpu`] for why the baseline is worth escaping.
+    fn pack_row_g128(row: &[f32], groups: usize, qw_row: &mut [u32], sz_row: &mut [u32]) -> ErrorAccum;
 }
 
 /// Reconstructs the weights a packed matrix represents.
@@ -178,22 +255,23 @@ pub fn quantize_int4_g128(w: &[f32], in_features: usize, out_features: usize) ->
 /// whereas a disagreement against the original weights is quantization error.
 pub fn dequantize_int4_g128(p: &PackedInt4) -> Vec<f32> {
     let groups = p.in_features / GROUP;
+    let words = p.in_features / 8;
     let mut out = vec![0f32; p.in_features * p.out_features];
 
-    for r in 0..p.out_features {
-        for g in 0..groups {
-            let packed_sz = p.sz[r * groups + g];
-            let scale = f16::from_bits(packed_sz as u16).to_f32();
-            let zero = f16::from_bits((packed_sz >> 16) as u16).to_f32();
-
-            for i in 0..GROUP {
-                let col = g * GROUP + i;
-                let word = p.qw[r * (p.in_features / 8) + col / 8];
-                let q = ((word >> (4 * (col % 8))) & 0xF) as f32;
-                out[r * p.in_features + col] = (q - zero) * scale;
+    out.par_chunks_mut(p.in_features)
+        .zip(p.qw.par_chunks(words))
+        .zip(p.sz.par_chunks(groups))
+        .for_each(|((dst, qw_row), sz_row)| {
+            for (g, &packed) in sz_row.iter().enumerate().take(groups) {
+                let scale = f16::from_bits(packed as u16).to_f32();
+                let zero = f16::from_bits((packed >> 16) as u16).to_f32();
+                for i in 0..GROUP {
+                    let col = g * GROUP + i;
+                    let q = ((qw_row[col / 8] >> (4 * (col % 8))) & 0xF) as f32;
+                    dst[col] = (q - zero) * scale;
+                }
             }
-        }
-    }
+        });
     out
 }
 
@@ -302,5 +380,44 @@ mod tests {
     fn rejects_bad_shapes() {
         assert!(quantize_int4_g128(&[0.0; 100], 100, 1).is_err(), "100 is not a multiple of 128");
         assert!(quantize_int4_g128(&[0.0; 10], 128, 1).is_err(), "slice too short for shape");
+    }
+
+    /// The fused metric replaced a reconstruct-then-compare pass. If the two
+    /// ever disagree, the packer and the dequantizer have drifted apart — which
+    /// is exactly the class of bug that would otherwise surface as unexplained
+    /// perplexity, because the file would decode to something the converter
+    /// never scored.
+    #[test]
+    fn fused_error_equals_reconstruct_then_measure() {
+        let (in_f, out_f) = (896usize, 97usize);
+        let w = weights(in_f * out_f);
+
+        let (p, fused) = quantize_int4_g128_measured(&w, in_f, out_f).unwrap();
+        let post = relative_error(&w, &dequantize_int4_g128(&p));
+        assert!(
+            (fused - post).abs() < 1e-9,
+            "g128 fused {fused} vs reconstructed {post}"
+        );
+
+        let (h, fused_h) = quantize_int4_hier_measured(&w, in_f, out_f).unwrap();
+        let post_h = relative_error(&w, &dequantize_int4_hier(&h));
+        assert!(
+            (fused_h - post_h).abs() < 1e-9,
+            "hier fused {fused_h} vs reconstructed {post_h}"
+        );
+    }
+
+    /// Rows are packed by a work-stealing pool, so the bytes must not depend on
+    /// how the work happened to be split. A shape with a prime row count and a
+    /// non-power-of-two group count is the awkward case.
+    #[test]
+    fn parallel_pack_is_deterministic() {
+        let (in_f, out_f) = (1216usize, 53usize);
+        let w = weights(in_f * out_f);
+        let a = quantize_int4_hier(&w, in_f, out_f).unwrap();
+        let b = quantize_int4_hier(&w, in_f, out_f).unwrap();
+        assert_eq!(a.qw, b.qw);
+        assert_eq!(a.si, b.si);
+        assert_eq!(a.sb, b.sb);
     }
 }

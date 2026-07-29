@@ -274,7 +274,7 @@ fn rope_and_attention_chunk_match_sequential_decode() {
     // Chunk path.
     let mut cache_a = decode::KvCache::new(n_kv, n_q, hd, max_seq).unwrap();
     let mut qkv_c = DeviceBuffer::from_slice(&qkv_all).unwrap();
-    chunk::rope_cache(&mut qkv_c, &mut cache_a, &rope, n_q, 0, n).unwrap();
+    chunk::rope_cache(&mut qkv_c, &mut cache_a, &rope, n_q, 0, n, None).unwrap();
     let mut out_c = DeviceBuffer::<u16>::zeros(n * n_q * hd).unwrap();
     chunk::attn(&qkv_c, &cache_a, &mut out_c, n_q, 0, n).unwrap();
     let got = from_f16(&out_c.to_vec().unwrap());
@@ -286,7 +286,7 @@ fn rope_and_attention_chunk_match_sequential_decode() {
         cursor.set(j as i32).unwrap();
         let mut qkv_1 =
             DeviceBuffer::from_slice(&qkv_all[j * stride..(j + 1) * stride]).unwrap();
-        decode::rope_cache(&mut qkv_1, &mut cache_b, &rope, n_q, &cursor).unwrap();
+        decode::rope_cache(&mut qkv_1, &mut cache_b, &rope, n_q, &cursor, None).unwrap();
         let mut out_1 = DeviceBuffer::<u16>::zeros(n_q * hd).unwrap();
         decode::attn_decode(&qkv_1, &mut cache_b, &mut out_1, n_q, &cursor).unwrap();
         let want = from_f16(&out_1.to_vec().unwrap());
@@ -327,14 +327,14 @@ fn attention_chunk_resumes_mid_cache() {
         for cache in [&mut cache_a, &mut cache_b] {
             let mut q1 =
                 DeviceBuffer::from_slice(&qkv_all[j * stride..(j + 1) * stride]).unwrap();
-            decode::rope_cache(&mut q1, cache, &rope, n_q, &cursor).unwrap();
+            decode::rope_cache(&mut q1, cache, &rope, n_q, &cursor, None).unwrap();
         }
     }
 
     // Chunk continues cache_a from `prefix`.
     let tail = &qkv_all[prefix * stride..(prefix + n) * stride];
     let mut qkv_c = DeviceBuffer::from_slice(tail).unwrap();
-    chunk::rope_cache(&mut qkv_c, &mut cache_a, &rope, n_q, prefix, n).unwrap();
+    chunk::rope_cache(&mut qkv_c, &mut cache_a, &rope, n_q, prefix, n, None).unwrap();
     let mut out_c = DeviceBuffer::<u16>::zeros(n * n_q * hd).unwrap();
     chunk::attn(&qkv_c, &cache_a, &mut out_c, n_q, prefix, n).unwrap();
     let got = from_f16(&out_c.to_vec().unwrap());
@@ -344,7 +344,7 @@ fn attention_chunk_resumes_mid_cache() {
         let p = prefix + j;
         cursor.set(p as i32).unwrap();
         let mut q1 = DeviceBuffer::from_slice(&tail[j * stride..(j + 1) * stride]).unwrap();
-        decode::rope_cache(&mut q1, &mut cache_b, &rope, n_q, &cursor).unwrap();
+        decode::rope_cache(&mut q1, &mut cache_b, &rope, n_q, &cursor, None).unwrap();
         let mut o1 = DeviceBuffer::<u16>::zeros(n_q * hd).unwrap();
         decode::attn_decode(&q1, &mut cache_b, &mut o1, n_q, &cursor).unwrap();
         let want = from_f16(&o1.to_vec().unwrap());

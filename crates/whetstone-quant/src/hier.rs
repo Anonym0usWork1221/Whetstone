@@ -53,8 +53,9 @@
 //! over-wide step and buys a kernel with no branch.
 
 use half::f16;
+use rayon::prelude::*;
 
-use crate::{Error, Result};
+use crate::{Error, ErrorAccum, Result};
 
 /// Weights sharing one `(ls, lm)` pair. 32 is not tunable: it is exactly one
 /// `uint4` load, so a lane handles precisely one group per step.
@@ -108,6 +109,7 @@ impl PackedInt4Hier {
 ///
 /// The importance weight `sqrt(mean(x²)) + |x|` is llama.cpp's. The offset
 /// matters — pure `|x|` weighting chases the outliers and abandons the bulk.
+#[inline(always)]
 fn fit_group(x: &[f32]) -> (f32, f32) {
     const NSTEP: usize = 20;
     const RMIN: f32 = -1.0;
@@ -123,7 +125,14 @@ fn fit_group(x: &[f32]) -> (f32, f32) {
         return (0.0, lo.min(0.0));
     }
 
-    let w: Vec<f32> = x.iter().map(|v| av + v.abs()).collect();
+    // Stack, not heap. This is called once per group of 32 -- 11 M times over a
+    // 0.5 B model, 238 M times over a 7 B one -- and a `collect()` here is one
+    // malloc/free pair per call for 128 bytes that never outlive the frame.
+    let mut wbuf = [0f32; 64];
+    for (o, v) in wbuf.iter_mut().zip(x) {
+        *o = av + v.abs();
+    }
+    let w = &wbuf[..x.len()];
     let sum_w: f32 = w.iter().sum();
     let sum_x: f32 = w.iter().zip(x).map(|(a, b)| a * b).sum();
 
@@ -132,7 +141,7 @@ fn fit_group(x: &[f32]) -> (f32, f32) {
     let mut best_err = {
         let s = best_scale;
         x.iter()
-            .zip(&w)
+            .zip(w)
             .map(|(v, wi)| {
                 let q = (((v - lo) / s).round()).clamp(0.0, QMAX);
                 let d = q * s + lo - v;
@@ -147,7 +156,7 @@ fn fit_group(x: &[f32]) -> (f32, f32) {
         // The levels are needed twice (for the normal equations and for the
         // error), and 32 floats is nothing to keep.
         let mut lvl = [0.0f32; 64];
-        for (i, (&v, &wi)) in x.iter().zip(&w).enumerate() {
+        for (i, (&v, &wi)) in x.iter().zip(w).enumerate() {
             let l = (iscale * (v - lo)).round().clamp(0.0, QMAX);
             lvl[i] = l;
             sum_l += wi * l;
@@ -169,7 +178,7 @@ fn fit_group(x: &[f32]) -> (f32, f32) {
 
         let err: f32 = x
             .iter()
-            .zip(&w)
+            .zip(w)
             .enumerate()
             .map(|(i, (v, wi))| {
                 let d = scale * lvl[i] + mn - v;
@@ -185,6 +194,133 @@ fn fit_group(x: &[f32]) -> (f32, f32) {
     (best_scale, best_min)
 }
 
+/// Rounds a row's shared scale to f16 while keeping it strictly positive and
+/// finite.
+///
+/// `d = max_scale / 15` is the one number every weight in the row is
+/// reconstructed against, and f16 has a narrow range on both ends:
+///
+/// - a row spanning less than about 1.3e-5 rounds `d` **to zero**, so
+///   `s = d * ls` is zero, `q = (w - m) / s` is an infinity or a NaN, and the
+///   whole row packs as garbage;
+/// - a row spanning more than about 1.5e7 rounds `d` to **infinity**, so every
+///   reconstruction is `inf * q + m`.
+///
+/// The first case is not hypothetical: it is what made `convert` report
+/// `mean rel. error NaN` on Qwen2.5-7B. It was invisible on the three smaller
+/// models, and invisible on 7 B too until the error metric moved inside the
+/// packer — the old reconstruct-afterwards path computed `q * 0 + m`, which is
+/// finite and wrong rather than NaN.
+///
+/// Clamping to the smallest positive subnormal rather than erroring is right
+/// because such a row *is* numerically zero next to a typical weight of ~0.02.
+/// The point is that it reconstructs as approximately zero instead of as NaN.
+#[inline(always)]
+fn shared_scale(v: f32) -> f16 {
+    if v.is_nan() || v <= 0.0 {
+        return f16::from_f32(1.0); // zero, negative, or NaN: nothing to scale
+    }
+    let h = f16::from_f32(v);
+    if h.to_f32() > 0.0 {
+        if h.is_finite() {
+            h
+        } else {
+            f16::MAX
+        }
+    } else {
+        f16::from_bits(1) // smallest positive subnormal, 5.96e-8
+    }
+}
+
+/// Packs one row. Writes into caller-owned, row-local slices so that rows carry
+/// no shared state at all and the outer loop can be a `rayon` fan-out.
+///
+/// `scratch_s` / `scratch_m` are per-thread buffers of length `groups`, reused
+/// across rows: at 7B there are ~1.9 M rows and a pair of allocations each would
+/// be pure churn.
+///
+/// Returns the row's contribution to `‖w − ŵ‖²` and `‖w‖²`. Accumulating it here
+/// rather than dequantizing afterwards is the difference between one pass and
+/// three: the old `report_error` path allocated a full f32 reconstruction of
+/// every tensor (15 GB of transient allocation over a 7B convert) purely to
+/// subtract it from the input again. The reconstruction is already in hand at
+/// the moment `q` is chosen.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn pack_row_hier_body(
+    row: &[f32],
+    groups: usize,
+    scratch_s: &mut [f32],
+    scratch_m: &mut [f32],
+    qw_row: &mut [u32],
+    si_row: &mut [u8],
+    sb_row: &mut u32,
+) -> ErrorAccum {
+    let mut max_scale = 0f32;
+    let mut max_min = 0f32;
+    for g in 0..groups {
+        let (s, m) = fit_group(&row[g * HGROUP..(g + 1) * HGROUP]);
+        scratch_s[g] = s;
+        scratch_m[g] = m;
+        max_scale = max_scale.max(s);
+        max_min = max_min.max(-m);
+    }
+
+    // The fp16 rounding happens here, before the indices are derived, so the
+    // indices are chosen against the value the kernel will actually read.
+    let d = shared_scale(if max_scale > 0.0 { max_scale / SMAX } else { 1.0 });
+    let dm_pos = max_min > 0.0;
+    let dm = shared_scale(if dm_pos { max_min / SMAX } else { 1.0 });
+    *sb_row = (d.to_bits() as u32) | ((dm.to_bits() as u32) << 16);
+
+    let df = d.to_f32();
+    let dmf = dm.to_f32();
+
+    let mut acc = ErrorAccum::default();
+    for (g, si) in si_row.iter_mut().enumerate().take(groups) {
+        // ls >= 1: see the module docs. A zero scale index would make every
+        // weight in the group reconstruct to `min` and force a special case
+        // into both the quantizer and the kernel.
+        let ls = (scratch_s[g] / df).round().clamp(1.0, SMAX) as u8;
+        let lm = if dm_pos {
+            ((-scratch_m[g]).max(0.0) / dmf).round().clamp(0.0, SMAX) as u8
+        } else {
+            0
+        };
+        *si = ls | (lm << 4);
+
+        let s = df * ls as f32;
+        let m = -dmf * lm as f32;
+        for i in 0..HGROUP {
+            let col = g * HGROUP + i;
+            let v = row[col];
+            let q = ((v - m) / s).round().clamp(0.0, QMAX);
+            qw_row[col / 8] |= (q as u32) << (4 * (col % 8));
+            acc.push(v, q * s + m);
+        }
+    }
+    acc
+}
+
+crate::isa_dispatch! {
+    body  = pack_row_hier_body,
+    avx2  = pack_row_hier_avx2,
+    sse41 = pack_row_hier_sse41;
+    /// [`pack_row_hier_body`], compiled per instruction set and selected at run
+    /// time. The dispatch is per row — thousands of cycles of work — so the
+    /// branch is free, and it keeps the packer a single source of truth.
+    #[allow(clippy::too_many_arguments)]
+    fn pack_row_hier(
+        row: &[f32],
+        groups: usize,
+        scratch_s: &mut [f32],
+        scratch_m: &mut [f32],
+        qw_row: &mut [u32],
+        si_row: &mut [u8],
+        sb_row: &mut u32,
+    ) -> ErrorAccum;
+}
+
 /// Quantizes a row-major `[out_features][in_features]` matrix to int4 with
 /// hierarchical scales.
 ///
@@ -194,11 +330,29 @@ fn fit_group(x: &[f32]) -> (f32, f32) {
 /// the stored `d*ls`, so choosing levels against the unquantized fit bakes in an
 /// error the dequantizer cannot undo. `quantize_row_q4_K_ref` does the same
 /// second pass for the same reason.
+///
+/// Rows are independent and are packed in parallel. See
+/// [`quantize_int4_hier_measured`] if the weight error is wanted — it comes
+/// free with the pack and costs a second full pass to recover afterwards.
 pub fn quantize_int4_hier(
     w: &[f32],
     in_features: usize,
     out_features: usize,
 ) -> Result<PackedInt4Hier> {
+    quantize_int4_hier_measured(w, in_features, out_features).map(|(p, _)| p)
+}
+
+/// [`quantize_int4_hier`], plus the relative Frobenius weight error, accumulated
+/// during packing rather than by reconstructing the matrix afterwards.
+///
+/// The error is a **smoke test for a broken packer, not a quality gate** — see
+/// the crate docs. A clip search that lowers it by 0.0035 raises perplexity by
+/// 0.50.
+pub fn quantize_int4_hier_measured(
+    w: &[f32],
+    in_features: usize,
+    out_features: usize,
+) -> Result<(PackedInt4Hier, f64)> {
     if in_features % HGROUP != 0 {
         return Err(Error::Shape(format!(
             "in_features {in_features} must be a multiple of {HGROUP}"
@@ -213,59 +367,27 @@ pub fn quantize_int4_hier(
     }
 
     let groups = in_features / HGROUP;
-    let mut qw = vec![0u32; out_features * in_features / 8];
+    let words = in_features / 8;
+    let mut qw = vec![0u32; out_features * words];
     let mut si = vec![0u8; out_features * groups];
     let mut sb = vec![0u32; out_features];
 
-    let mut scales = vec![0f32; groups];
-    let mut mins = vec![0f32; groups];
+    // Every row owns a disjoint slice of all three outputs, so the fan-out needs
+    // no synchronisation and no atomics. The reduction is over the error only.
+    let acc = qw
+        .par_chunks_mut(words)
+        .zip(si.par_chunks_mut(groups))
+        .zip(sb.par_iter_mut())
+        .zip(w.par_chunks(in_features))
+        .map_init(
+            || (vec![0f32; groups], vec![0f32; groups]),
+            |(ss, sm), (((qw_row, si_row), sb_row), row)| {
+                pack_row_hier(row, groups, ss, sm, qw_row, si_row, sb_row)
+            },
+        )
+        .reduce(ErrorAccum::default, ErrorAccum::merge);
 
-    for r in 0..out_features {
-        let row = &w[r * in_features..(r + 1) * in_features];
-
-        let mut max_scale = 0f32;
-        let mut max_min = 0f32;
-        for g in 0..groups {
-            let (s, m) = fit_group(&row[g * HGROUP..(g + 1) * HGROUP]);
-            scales[g] = s;
-            mins[g] = m;
-            max_scale = max_scale.max(s);
-            max_min = max_min.max(-m);
-        }
-
-        // The fp16 rounding happens here, before the indices are derived, so the
-        // indices are chosen against the value the kernel will actually read.
-        let d = f16::from_f32(if max_scale > 0.0 { max_scale / SMAX } else { 1.0 });
-        let dm_pos = max_min > 0.0;
-        let dm = f16::from_f32(if dm_pos { max_min / SMAX } else { 1.0 });
-        sb[r] = (d.to_bits() as u32) | ((dm.to_bits() as u32) << 16);
-
-        let df = d.to_f32();
-        let dmf = dm.to_f32();
-
-        for g in 0..groups {
-            // ls >= 1: see the module docs. A zero scale index would make every
-            // weight in the group reconstruct to `min` and force a special case
-            // into both the quantizer and the kernel.
-            let ls = (scales[g] / df).round().clamp(1.0, SMAX) as u8;
-            let lm = if dm_pos {
-                ((-mins[g]).max(0.0) / dmf).round().clamp(0.0, SMAX) as u8
-            } else {
-                0
-            };
-            si[r * groups + g] = ls | (lm << 4);
-
-            let s = df * ls as f32;
-            let m = -dmf * lm as f32;
-            for i in 0..HGROUP {
-                let col = g * HGROUP + i;
-                let q = ((row[col] - m) / s).round().clamp(0.0, QMAX) as u32;
-                qw[r * (in_features / 8) + col / 8] |= q << (4 * (col % 8));
-            }
-        }
-    }
-
-    Ok(PackedInt4Hier { qw, si, sb, in_features, out_features })
+    Ok((PackedInt4Hier { qw, si, sb, in_features, out_features }, acc.relative()))
 }
 
 /// Reconstructs the weights a packed matrix represents.
@@ -275,23 +397,26 @@ pub fn quantize_int4_hier(
 /// bug, a disagreement against the original weights is quantization error.
 pub fn dequantize_int4_hier(p: &PackedInt4Hier) -> Vec<f32> {
     let groups = p.in_features / HGROUP;
+    let words = p.in_features / 8;
     let mut out = vec![0f32; p.in_features * p.out_features];
 
-    for r in 0..p.out_features {
-        let d = f16::from_bits(p.sb[r] as u16).to_f32();
-        let dm = f16::from_bits((p.sb[r] >> 16) as u16).to_f32();
-        for g in 0..groups {
-            let idx = p.si[r * groups + g];
-            let s = d * (idx & 0xF) as f32;
-            let m = -dm * (idx >> 4) as f32;
-            for i in 0..HGROUP {
-                let col = g * HGROUP + i;
-                let word = p.qw[r * (p.in_features / 8) + col / 8];
-                let q = ((word >> (4 * (col % 8))) & 0xF) as f32;
-                out[r * p.in_features + col] = q * s + m;
+    out.par_chunks_mut(p.in_features)
+        .zip(p.qw.par_chunks(words))
+        .zip(p.si.par_chunks(groups))
+        .zip(p.sb.par_iter())
+        .for_each(|(((dst, qw_row), si_row), &sbw)| {
+            let d = f16::from_bits(sbw as u16).to_f32();
+            let dm = f16::from_bits((sbw >> 16) as u16).to_f32();
+            for (g, &idx) in si_row.iter().enumerate().take(groups) {
+                let s = d * (idx & 0xF) as f32;
+                let m = -dm * (idx >> 4) as f32;
+                for i in 0..HGROUP {
+                    let col = g * HGROUP + i;
+                    let q = ((qw_row[col / 8] >> (4 * (col % 8))) & 0xF) as f32;
+                    dst[col] = q * s + m;
+                }
             }
-        }
-    }
+        });
     out
 }
 
@@ -394,5 +519,40 @@ mod tests {
     fn rejects_bad_shapes() {
         assert!(quantize_int4_hier(&[0.0; 100], 100, 1).is_err());
         assert!(quantize_int4_hier(&[0.0; 10], 32, 1).is_err());
+    }
+
+    /// A row whose weights are tiny but non-zero underflows the shared fp16 `d`.
+    ///
+    /// `d = max_scale / 15`, and f16's smallest positive subnormal is 5.96e-8,
+    /// so a row spanning less than about 1.3e-5 rounds `d` to **zero**. Then
+    /// `s = d * ls` is zero, `q = (w - m) / s` is an infinity or a NaN, and the
+    /// row reconstructs to garbage.
+    ///
+    /// Found on Qwen2.5-7B, where `convert` reported `mean rel. error NaN`. It
+    /// was invisible on the three smaller models and invisible before the error
+    /// metric was fused into the packer, because the old reconstruct-afterwards
+    /// path computed `q * 0 + m`, which is finite and wrong rather than NaN.
+    #[test]
+    fn tiny_rows_do_not_underflow_the_shared_scale() {
+        let (in_f, out_f) = (256usize, 4usize);
+        let mut w = vec![0f32; in_f * out_f];
+        // Row 0: ordinary magnitudes. Row 1: a hundred-millionth of that.
+        for i in 0..in_f {
+            w[i] = ((i % 17) as f32 - 8.0) * 0.01;
+            w[in_f + i] = ((i % 17) as f32 - 8.0) * 1e-10;
+        }
+        let (p, e) = quantize_int4_hier_measured(&w, in_f, out_f).unwrap();
+        assert!(e.is_finite(), "relative error is {e}");
+
+        let d = dequantize_int4_hier(&p);
+        assert!(d.iter().all(|v| v.is_finite()), "dequantized row is not finite");
+
+        // Every shared scale must be a usable positive number, not zero and not
+        // an infinity: the kernel divides nothing by it but it multiplies every
+        // weight in the row.
+        for (r, &sb) in p.sb.iter().enumerate() {
+            let dv = half::f16::from_bits(sb as u16).to_f32();
+            assert!(dv > 0.0 && dv.is_finite(), "row {r} shared scale is {dv}");
+        }
     }
 }

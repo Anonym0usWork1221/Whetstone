@@ -102,7 +102,8 @@ __global__ void rope_cache_chunk_kernel(
     float *__restrict__ qkv, int qkv_stride, half *__restrict__ k_cache,
     half *__restrict__ v_cache, const float *__restrict__ cos_tab,
     const float *__restrict__ sin_tab, int n_q, int n_kv, int hd, int pos0, int n,
-    int max_seq) {
+    int max_seq, const half *__restrict__ q_norm_w, const half *__restrict__ k_norm_w,
+    float eps) {
 
   const int head = blockIdx.x;
   const int j = blockIdx.y;
@@ -110,11 +111,12 @@ __global__ void rope_cache_chunk_kernel(
 
   const int halfd = hd >> 1;
   const int t = threadIdx.x;
-  if (t >= halfd) return;
+  /* Padded to a whole warp when QK-norm is on -- see the decode kernel. */
+  const bool active = (t < halfd);
 
   const int pos = min(pos0 + j, max_seq - 1);
-  const float c = cos_tab[(size_t)pos * halfd + t];
-  const float s = sin_tab[(size_t)pos * halfd + t];
+  const float c = active ? cos_tab[(size_t)pos * halfd + t] : 0.0f;
+  const float s = active ? sin_tab[(size_t)pos * halfd + t] : 0.0f;
 
   float *row = qkv + (size_t)j * qkv_stride;
   const float *k = row + (size_t)n_q * hd;
@@ -122,7 +124,10 @@ __global__ void rope_cache_chunk_kernel(
 
   if (head < n_q) {
     float *qh = row + (size_t)head * hd;
-    const float x1 = qh[t], x2 = qh[t + halfd];
+    float x1 = active ? qh[t] : 0.0f;
+    float x2 = active ? qh[t + halfd] : 0.0f;
+    if (q_norm_w) wst_qk_head_norm(x1, x2, q_norm_w, t, halfd, hd, eps, active);
+    if (!active) return;
     qh[t] = x1 * c - x2 * s;
     qh[t + halfd] = x2 * c + x1 * s;
     return;
@@ -134,7 +139,10 @@ __global__ void rope_cache_chunk_kernel(
   const size_t slot = ((size_t)kvh * max_seq + pos) * hd;
 
   const float *kh = k + (size_t)kvh * hd;
-  const float k1 = kh[t], k2 = kh[t + halfd];
+  float k1 = active ? kh[t] : 0.0f;
+  float k2 = active ? kh[t + halfd] : 0.0f;
+  if (k_norm_w) wst_qk_head_norm(k1, k2, k_norm_w, t, halfd, hd, eps, active);
+  if (!active) return;
   k_cache[slot + t] = __float2half(k1 * c - k2 * s);
   k_cache[slot + t + halfd] = __float2half(k2 * c + k1 * s);
 
@@ -146,7 +154,9 @@ __global__ void rope_cache_chunk_kernel(
 extern "C" wst_status_t wst_rope_cache_chunk(void *qkv, void *k_cache, void *v_cache,
                                              const void *cos_tab, const void *sin_tab,
                                              int32_t n_q, int32_t n_kv, int32_t head_dim,
-                                             int32_t pos0, int32_t n, int32_t max_seq) {
+                                             int32_t pos0, int32_t n, int32_t max_seq,
+                                             const void *q_norm_w, const void *k_norm_w,
+                                             float eps) {
   WST_REQUIRE(qkv && k_cache && v_cache && cos_tab && sin_tab,
               "wst_rope_cache_chunk: null pointer");
   WST_REQUIRE(n_q > 0 && n_kv > 0 && head_dim > 0 && n > 0,
@@ -159,10 +169,13 @@ extern "C" wst_status_t wst_rope_cache_chunk(void *qkv, void *k_cache, void *v_c
   WST_REQUIRE(halfd <= 1024, "wst_rope_cache_chunk: head_dim/2 exceeds a block");
 
   const int qkv_stride = (n_q + 2 * n_kv) * head_dim;
-  rope_cache_chunk_kernel<<<dim3(n_q + n_kv, n), halfd>>>(
+  const bool norm = (q_norm_w != nullptr) || (k_norm_w != nullptr);
+  const int threads = norm ? ((halfd + WST_WARP - 1) / WST_WARP) * WST_WARP : halfd;
+
+  rope_cache_chunk_kernel<<<dim3(n_q + n_kv, n), threads>>>(
       (float *)qkv, qkv_stride, (half *)k_cache, (half *)v_cache,
       (const float *)cos_tab, (const float *)sin_tab, n_q, n_kv, head_dim, pos0, n,
-      max_seq);
+      max_seq, (const half *)q_norm_w, (const half *)k_norm_w, eps);
   WST_TRY_KERNEL("wst_rope_cache_chunk");
   return WST_OK;
 }

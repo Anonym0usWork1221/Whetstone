@@ -112,12 +112,17 @@ extern "C" wst_status_t wst_rmsnorm(const void *x, const void *w, void *out,
 __global__ void rope_cache_kernel(
     float *__restrict__ qkv, half *__restrict__ k_cache, half *__restrict__ v_cache,
     const float *__restrict__ cos_tab, const float *__restrict__ sin_tab,
-    int n_q, int n_kv, int hd, const int32_t *__restrict__ pos_dev, int max_seq) {
+    int n_q, int n_kv, int hd, const int32_t *__restrict__ pos_dev, int max_seq,
+    const half *__restrict__ q_norm_w, const half *__restrict__ k_norm_w, float eps) {
 
   const int head = blockIdx.x;
   const int halfd = hd >> 1;
   const int j = threadIdx.x;
-  if (j >= halfd) return;
+
+  /* The block is padded up to a whole warp when QK-norm is on, because the
+   * block reduction masks a full warp. Padding lanes must reach the barriers,
+   * so this is a predicate rather than an early return. */
+  const bool active = (j < halfd);
 
   /* The position lives on the device so the whole decode step is capturable as
    * a CUDA graph -- a graph bakes its kernel arguments in at instantiation, so
@@ -126,8 +131,8 @@ __global__ void rope_cache_kernel(
    * host before it launches. */
   const int pos = min(max(*pos_dev, 0), max_seq - 1);
 
-  const float c = cos_tab[(size_t)pos * halfd + j];
-  const float s = sin_tab[(size_t)pos * halfd + j];
+  const float c = active ? cos_tab[(size_t)pos * halfd + j] : 0.0f;
+  const float s = active ? sin_tab[(size_t)pos * halfd + j] : 0.0f;
 
   /* q, k and v arrive as one contiguous vector because they come out of one
    * fused projection -- three separate GEMVs of 896, 128 and 128 rows cannot
@@ -136,10 +141,15 @@ __global__ void rope_cache_kernel(
   const float *k = qkv + (size_t)n_q * hd;
   const float *v = k + (size_t)n_kv * hd;
 
+  /* Both branches below are uniform across the block -- they test blockIdx --
+   * so the barriers inside `wst_qk_head_norm` are reached by every thread. */
   if (head < n_q) {
     /* Query heads: rotate in place; nothing is cached. */
     float *qh = qkv + (size_t)head * hd;
-    const float x1 = qh[j], x2 = qh[j + halfd];
+    float x1 = active ? qh[j] : 0.0f;
+    float x2 = active ? qh[j + halfd] : 0.0f;
+    if (q_norm_w) wst_qk_head_norm(x1, x2, q_norm_w, j, halfd, hd, eps, active);
+    if (!active) return;
     qh[j] = x1 * c - x2 * s;
     qh[j + halfd] = x2 * c + x1 * s;
     return;
@@ -151,12 +161,17 @@ __global__ void rope_cache_kernel(
   const size_t slot = ((size_t)kvh * max_seq + pos) * hd;
 
   const float *kh = k + (size_t)kvh * hd;
-  const float k1 = kh[j], k2 = kh[j + halfd];
+  float k1 = active ? kh[j] : 0.0f;
+  float k2 = active ? kh[j + halfd] : 0.0f;
+  if (k_norm_w) wst_qk_head_norm(k1, k2, k_norm_w, j, halfd, hd, eps, active);
+  if (!active) return;
   k_cache[slot + j] = __float2half(k1 * c - k2 * s);
   k_cache[slot + j + halfd] = __float2half(k2 * c + k1 * s);
 
   /* v is not rotated -- position information enters only through the scores --
-   * but it is cached from the same block so the copy costs no extra launch. */
+   * and it is never QK-normed either: the norm exists to stabilise the *scores*,
+   * and v does not enter them. It is cached from the same block so the copy
+   * costs no extra launch. */
   const float *vh = v + (size_t)kvh * hd;
   v_cache[slot + j] = __float2half(vh[j]);
   v_cache[slot + j + halfd] = __float2half(vh[j + halfd]);
@@ -165,7 +180,9 @@ __global__ void rope_cache_kernel(
 extern "C" wst_status_t wst_rope_cache(void *qkv, void *k_cache, void *v_cache,
                                        const void *cos_tab, const void *sin_tab,
                                        int32_t n_q, int32_t n_kv, int32_t head_dim,
-                                       const void *pos, int32_t max_seq) {
+                                       const void *pos, int32_t max_seq,
+                                       const void *q_norm_w, const void *k_norm_w,
+                                       float eps) {
   WST_REQUIRE(qkv && k_cache && v_cache && cos_tab && sin_tab && pos,
               "wst_rope_cache: null pointer");
   WST_REQUIRE(n_q > 0 && n_kv > 0 && head_dim > 0, "wst_rope_cache: non-positive shape");
@@ -175,10 +192,17 @@ extern "C" wst_status_t wst_rope_cache(void *qkv, void *k_cache, void *v_cache,
   const int halfd = head_dim / 2;
   WST_REQUIRE(halfd <= 1024, "wst_rope_cache: head_dim/2 exceeds a block");
 
-  rope_cache_kernel<<<n_q + n_kv, halfd>>>(
+  /* Round up to a whole warp: the block reduction shuffles with a full mask,
+   * which is undefined if the warp is not fully populated. Without QK-norm
+   * there is no reduction and the exact width is kept. */
+  const bool norm = (q_norm_w != nullptr) || (k_norm_w != nullptr);
+  const int threads = norm ? ((halfd + WST_WARP - 1) / WST_WARP) * WST_WARP : halfd;
+
+  rope_cache_kernel<<<n_q + n_kv, threads>>>(
       (float *)qkv, (half *)k_cache, (half *)v_cache,
       (const float *)cos_tab, (const float *)sin_tab, n_q, n_kv, head_dim,
-      (const int32_t *)pos, max_seq);
+      (const int32_t *)pos, max_seq, (const half *)q_norm_w, (const half *)k_norm_w,
+      eps);
   WST_TRY_KERNEL("wst_rope_cache");
   return WST_OK;
 }

@@ -1,5 +1,8 @@
 # Rust
 /target/
+# Alternate build dirs: `WHETSTONE_CUDA_ARCH=native` and `=all` are kept
+# side by side so a fat build does not invalidate the fast iteration build.
+/target-*/
 **/*.rs.bk
 *.pdb
 

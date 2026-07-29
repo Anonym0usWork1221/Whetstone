@@ -173,6 +173,22 @@ pub struct KvCache {
 }
 
 impl KvCache {
+    /// The key cache, `[n_kv][max_seq][head_dim]` f16, already rotated.
+    ///
+    /// Read-only, and exposed so a differential test can check what actually
+    /// landed in the cache rather than inferring it from attention output. Keys
+    /// are written *after* RoPE and after QK-norm, so this is the only place
+    /// those two can be observed separately.
+    pub fn keys(&self) -> &DeviceBuffer<u16> {
+        &self.k
+    }
+
+    /// The value cache, `[n_kv][max_seq][head_dim]` f16. Never rotated and never
+    /// normed: position and gain both enter only through the scores.
+    pub fn values(&self) -> &DeviceBuffer<u16> {
+        &self.v
+    }
+
     /// Allocates a cache for `layers` is handled by the caller; this is one layer.
     pub fn new(n_kv: usize, n_q: usize, head_dim: usize, max_seq: usize) -> Result<Self> {
         let n = n_kv * max_seq * head_dim;
@@ -239,12 +255,50 @@ impl DeviceCursor {
     }
 }
 
+/// The per-head RMSNorm gains that Qwen3, OLMo2 and Gemma2 apply to the query
+/// and key vectors *before* RoPE.
+///
+/// One gain vector of `head_dim` entries for q and one for k, shared across
+/// every head. Borrowed rather than owned: they live in the model's weights for
+/// as long as the model does, and copying them per token would be 512 bytes of
+/// pointless traffic on the launch-critical path.
+///
+/// A family without QK-norm passes `None` and the kernel skips both the block
+/// reduction and the warp padding, so the existing Qwen2/Llama path is
+/// unchanged instruction for instruction.
+#[derive(Clone, Copy)]
+pub struct QkNorm<'a> {
+    /// Gain applied to each query head, `head_dim` fp16 entries.
+    pub q: &'a DeviceBuffer<u16>,
+    /// Gain applied to each key head, `head_dim` fp16 entries.
+    pub k: &'a DeviceBuffer<u16>,
+    /// The model's `rms_norm_eps`.
+    pub eps: f32,
+}
+
+impl QkNorm<'_> {
+    fn check(&self, hd: usize) -> Result<()> {
+        if self.q.len() != hd || self.k.len() != hd {
+            return Err(Error::Shape(format!(
+                "qk_norm: gains are q[{}], k[{}]; both must be head_dim {hd}",
+                self.q.len(),
+                self.k.len()
+            )));
+        }
+        Ok(())
+    }
+}
+
 /// Applies rotary embedding to `q` in place and to `k` on the way into the
 /// cache, and copies `v` into the cache alongside it.
 ///
 /// Three operations in one launch because they all touch the same freshly
 /// projected vectors and there is no arithmetic left to amortise — only
 /// dispatch. `v` is not rotated: position enters only through the scores.
+///
+/// With `qk_norm` set, a fourth joins them: the per-head RMSNorm goes *before*
+/// the rotation and reuses the head vector this kernel has already loaded into
+/// registers. See [`QkNorm`].
 ///
 /// The position comes from a [`DeviceCursor`], so this call is identical on
 /// every token and can be captured once into a graph.
@@ -254,6 +308,7 @@ pub fn rope_cache(
     table: &RopeTable,
     n_q: usize,
     pos: &DeviceCursor,
+    qk_norm: Option<QkNorm<'_>>,
 ) -> Result<()> {
     let hd = cache.head_dim;
     let want = (n_q + 2 * cache.n_kv) * hd;
@@ -269,11 +324,16 @@ pub fn rope_cache(
             "rope_cache: rotary table does not match the cache geometry".into(),
         ));
     }
+    if let Some(n) = &qk_norm {
+        n.check(hd)?;
+    }
+    let (qw, kw, eps) = norm_ptrs(&qk_norm);
 
     // SAFETY: every shape is validated above against the dimensions the kernel
-    // indexes. The position is a live one-element device buffer, and the kernel
-    // clamps it into the cache rather than trusting it -- it cannot be checked
-    // here because inside a graph the host never sees the value.
+    // indexes, including the two gain vectors. The position is a live
+    // one-element device buffer, and the kernel clamps it into the cache rather
+    // than trusting it -- it cannot be checked here because inside a graph the
+    // host never sees the value. Null gain pointers select the no-norm path.
     check(unsafe {
         ffi::wst_rope_cache(
             qkv.as_mut_ptr(),
@@ -286,8 +346,22 @@ pub fn rope_cache(
             hd as i32,
             pos.buf.as_ptr(),
             cache.max_seq as i32,
+            qw,
+            kw,
+            eps,
         )
     })
+}
+
+/// Raw pointers for the optional gains, or nulls. Shared by the single-token
+/// and chunk paths so the two cannot disagree about what "off" means.
+pub(crate) fn norm_ptrs(
+    qk: &Option<QkNorm<'_>>,
+) -> (*const std::ffi::c_void, *const std::ffi::c_void, f32) {
+    match qk {
+        Some(n) => (n.q.as_ptr(), n.k.as_ptr(), n.eps),
+        None => (std::ptr::null(), std::ptr::null(), 0.0),
+    }
 }
 
 /// Batch=1 GQA attention over cache entries `0..=pos`.

@@ -108,7 +108,7 @@ fn rope_uses_the_half_rotation_layout() {
     let mut qd = DeviceBuffer::from_slice(&qkv).unwrap();
     let cursor = DeviceCursor::new(pos as i32).unwrap();
 
-    rope_cache(&mut qd, &mut cache, &table, n_q, &cursor).unwrap();
+    rope_cache(&mut qd, &mut cache, &table, n_q, &cursor, None).unwrap();
     let got = qd.to_vec().unwrap();
 
     let half = hd / 2;
@@ -122,6 +122,167 @@ fn rope_uses_the_half_rotation_layout() {
             assert!((got[h * hd + j] - w1).abs() < 1e-5, "head {h} lo {j}");
             assert!((got[h * hd + j + half] - w2).abs() < 1e-5, "head {h} hi {j}");
         }
+    }
+}
+
+/// QK-RMSNorm has to run **before** the rotation, over each head's own vector,
+/// against a gain shared by every head.
+///
+/// Every part of that sentence is a way to get it wrong that still produces
+/// fluent text: normalising after RoPE, normalising over the whole projection
+/// instead of per head, or applying the query gain to the keys. So this compares
+/// against an independent f64 reference rather than checking that the output
+/// merely changed.
+///
+/// `v` is deliberately included and deliberately not normalised — the gains
+/// exist to stabilise the *scores*, and `v` does not enter them.
+#[test]
+fn qk_norm_is_per_head_and_precedes_the_rotation() {
+    if !gpu() {
+        eprintln!("skip: no CUDA device");
+        return;
+    }
+    let (n_q, n_kv, hd, max_seq, pos) = (4usize, 2usize, 64usize, 8usize, 5usize);
+    let theta = 1_000_000.0f64;
+    let eps = 1e-6f32;
+
+    let q: Vec<f32> = (0..n_q * hd).map(|i| (i % 31) as f32 / 15.0 - 1.0).collect();
+    let k: Vec<f32> = (0..n_kv * hd).map(|i| (i % 23) as f32 / 11.0 - 1.0).collect();
+    let v: Vec<f32> = (0..n_kv * hd).map(|i| (i % 19) as f32 / 9.0 - 1.0).collect();
+
+    // Distinct, non-unit gains: a q/k mix-up is invisible if they are equal, and
+    // a missing multiply is invisible if they are 1.
+    let gq: Vec<f32> = (0..hd).map(|i| 0.5 + (i % 7) as f32 * 0.1).collect();
+    let gk: Vec<f32> = (0..hd).map(|i| 1.5 - (i % 5) as f32 * 0.2).collect();
+    let gqd = DeviceBuffer::from_slice(&f16v(&gq)).unwrap();
+    let gkd = DeviceBuffer::from_slice(&f16v(&gk)).unwrap();
+
+    let table = RopeTable::new(max_seq, hd, theta).unwrap();
+    let mut cache = KvCache::new(n_kv, n_q, hd, max_seq).unwrap();
+    let mut qkv = q.clone();
+    qkv.extend_from_slice(&k);
+    qkv.extend_from_slice(&v);
+    let mut qd = DeviceBuffer::from_slice(&qkv).unwrap();
+    let cursor = DeviceCursor::new(pos as i32).unwrap();
+
+    let norm = QkNorm { q: &gqd, k: &gkd, eps };
+    rope_cache(&mut qd, &mut cache, &table, n_q, &cursor, Some(norm)).unwrap();
+    let got = qd.to_vec().unwrap();
+
+    // Reference: per-head RMS over all `hd` entries, then the gain, then rotate.
+    let half = hd / 2;
+    for h in 0..n_q {
+        let head = &q[h * hd..(h + 1) * hd];
+        let ms = head.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>() / hd as f64;
+        let inv = 1.0 / (ms + eps as f64).sqrt();
+
+        for j in 0..half {
+            let freq = theta.powf(-(j as f64) / half as f64);
+            let (s, c) = (pos as f64 * freq).sin_cos();
+            // f16 gains: round the reference through f16 too, or the comparison
+            // is against a number the kernel was never given.
+            let g1 = half::f16::from_f32(gq[j]).to_f32() as f64;
+            let g2 = half::f16::from_f32(gq[j + half]).to_f32() as f64;
+            let x1 = head[j] as f64 * inv * g1;
+            let x2 = head[j + half] as f64 * inv * g2;
+
+            let w1 = (x1 * c - x2 * s) as f32;
+            let w2 = (x2 * c + x1 * s) as f32;
+            let tol = 1e-4 * w1.abs().max(w2.abs()).max(1.0);
+            assert!((got[h * hd + j] - w1).abs() < tol, "q head {h} lo {j}: {} vs {w1}", got[h * hd + j]);
+            assert!(
+                (got[h * hd + j + half] - w2).abs() < tol,
+                "q head {h} hi {j}: {} vs {w2}",
+                got[h * hd + j + half]
+            );
+        }
+    }
+
+    // Keys land in the cache already normed and rotated, with their *own* gain.
+    let kc = from_f16(&cache.keys().to_vec().unwrap());
+    for h in 0..n_kv {
+        let head = &k[h * hd..(h + 1) * hd];
+        let ms = head.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>() / hd as f64;
+        let inv = 1.0 / (ms + eps as f64).sqrt();
+        let slot = (h * max_seq + pos) * hd;
+
+        for j in 0..half {
+            let freq = theta.powf(-(j as f64) / half as f64);
+            let (s, c) = (pos as f64 * freq).sin_cos();
+            let g1 = half::f16::from_f32(gk[j]).to_f32() as f64;
+            let g2 = half::f16::from_f32(gk[j + half]).to_f32() as f64;
+            let x1 = head[j] as f64 * inv * g1;
+            let x2 = head[j + half] as f64 * inv * g2;
+            let w1 = (x1 * c - x2 * s) as f32;
+            let w2 = (x2 * c + x1 * s) as f32;
+            // The cache is f16, so the tolerance is the cache's resolution.
+            assert!((kc[slot + j] - w1).abs() < 3e-3, "k head {h} lo {j}: {} vs {w1}", kc[slot + j]);
+            assert!(
+                (kc[slot + j + half] - w2).abs() < 3e-3,
+                "k head {h} hi {j}: {} vs {w2}",
+                kc[slot + j + half]
+            );
+        }
+    }
+
+    // v must be untouched: it never enters a score, so it is never normed.
+    let vc = from_f16(&cache.values().to_vec().unwrap());
+    for h in 0..n_kv {
+        let slot = (h * max_seq + pos) * hd;
+        for j in 0..hd {
+            assert!(
+                (vc[slot + j] - v[h * hd + j]).abs() < 3e-3,
+                "v head {h} element {j} was modified"
+            );
+        }
+    }
+}
+
+/// With unit gains and a zero epsilon, QK-norm is exactly a rescale by the head
+/// RMS — so a head that is already unit-RMS must come out bit-for-bit the same
+/// as the no-norm path. That pins "off" and "on with an identity gain" together,
+/// which is what makes the `None` fast path safe to keep.
+#[test]
+fn qk_norm_with_unit_gain_on_a_unit_rms_head_is_the_identity() {
+    if !gpu() {
+        eprintln!("skip: no CUDA device");
+        return;
+    }
+    let (n_q, n_kv, hd, max_seq, pos) = (2usize, 1usize, 64usize, 8usize, 2usize);
+    let theta = 1_000_000.0f64;
+
+    // ±1 everywhere: mean of squares is exactly 1, so the norm is a no-op.
+    let q: Vec<f32> = (0..n_q * hd).map(|i| if i % 3 == 0 { -1.0 } else { 1.0 }).collect();
+    let k: Vec<f32> = (0..n_kv * hd).map(|i| if i % 5 == 0 { -1.0 } else { 1.0 }).collect();
+    let v: Vec<f32> = (0..n_kv * hd).map(|i| (i % 19) as f32 / 9.0 - 1.0).collect();
+    let ones = f16v(&vec![1.0f32; hd]);
+    let gqd = DeviceBuffer::from_slice(&ones).unwrap();
+    let gkd = DeviceBuffer::from_slice(&ones).unwrap();
+
+    let table = RopeTable::new(max_seq, hd, theta).unwrap();
+    let mut qkv = q.clone();
+    qkv.extend_from_slice(&k);
+    qkv.extend_from_slice(&v);
+
+    let mut cache_off = KvCache::new(n_kv, n_q, hd, max_seq).unwrap();
+    let mut off = DeviceBuffer::from_slice(&qkv).unwrap();
+    let cursor = DeviceCursor::new(pos as i32).unwrap();
+    rope_cache(&mut off, &mut cache_off, &table, n_q, &cursor, None).unwrap();
+
+    let mut cache_on = KvCache::new(n_kv, n_q, hd, max_seq).unwrap();
+    let mut on = DeviceBuffer::from_slice(&qkv).unwrap();
+    rope_cache(
+        &mut on,
+        &mut cache_on,
+        &table,
+        n_q,
+        &cursor,
+        Some(QkNorm { q: &gqd, k: &gkd, eps: 0.0 }),
+    )
+    .unwrap();
+
+    for (i, (a, b)) in off.to_vec().unwrap().iter().zip(&on.to_vec().unwrap()).enumerate() {
+        assert!((a - b).abs() < 1e-6, "element {i}: norm-off {a}, norm-on {b}");
     }
 }
 
@@ -148,7 +309,7 @@ fn attention_over_one_position_returns_that_value() {
     qkv.extend_from_slice(&v);
     let mut qd = DeviceBuffer::from_slice(&qkv).unwrap();
     let cursor = DeviceCursor::new(0).unwrap();
-    rope_cache(&mut qd, &mut cache, &table, n_q, &cursor).unwrap();
+    rope_cache(&mut qd, &mut cache, &table, n_q, &cursor, None).unwrap();
 
     let mut out = DeviceBuffer::<u16>::zeros(n_q * hd).unwrap();
     attn_decode(&qd, &mut cache, &mut out, n_q, &cursor).unwrap();
@@ -208,7 +369,7 @@ fn attention_over_two_positions_matches_an_explicit_softmax() {
         qkv.extend_from_slice(&v);
         let mut qd = DeviceBuffer::from_slice(&qkv).unwrap();
         let cursor = DeviceCursor::new(p as i32).unwrap();
-        rope_cache(&mut qd, &mut cache, &table, n_q, &cursor).unwrap();
+        rope_cache(&mut qd, &mut cache, &table, n_q, &cursor, None).unwrap();
         ks.push(rotate(&k, p));
         vs.push(v);
     }

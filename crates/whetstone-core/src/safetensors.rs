@@ -15,6 +15,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use memmap2::Mmap;
+use rayon::prelude::*;
 use serde::Deserialize;
 
 use crate::error::{Error, Result};
@@ -281,46 +282,68 @@ impl SafeTensors {
     /// Reads a tensor as `f32`, converting from whatever it was stored as.
     ///
     /// This allocates. It is for the quantizer and for tests, not the hot path.
+    ///
+    /// Parallel over 64 Ki-element strips. Widening is trivially parallel and it
+    /// is not free at scale: a 7 B checkpoint is 15 GB of bf16 in, 30 GB of f32
+    /// out, and as a serial `push` loop that was minutes of the conversion. The
+    /// strips also give the page-fault path more queue depth, which matters more
+    /// than the arithmetic when the checkpoint is on a spinning disk.
     pub fn to_f32(&self, name: &str) -> Result<Vec<f32>> {
         let t = self.get(name)?;
         let raw = self.bytes(name)?;
         let n = t.numel();
-        let mut out = Vec::with_capacity(n);
 
-        match t.dtype {
-            Dtype::F32 => {
-                for c in raw.chunks_exact(4) {
-                    out.push(f32::from_le_bytes(c.try_into().unwrap()));
-                }
-            }
-            Dtype::F16 => {
-                for c in raw.chunks_exact(2) {
-                    out.push(half::f16::from_le_bytes(c.try_into().unwrap()).to_f32());
-                }
-            }
-            Dtype::BF16 => {
-                // bf16 is the top 16 bits of an f32, so widening is a shift.
-                for c in raw.chunks_exact(2) {
-                    let bits = u16::from_le_bytes(c.try_into().unwrap());
-                    out.push(f32::from_bits((bits as u32) << 16));
-                }
-            }
-            Dtype::I8 => out.extend(raw.iter().map(|&b| b as i8 as f32)),
-            Dtype::U8 => out.extend(raw.iter().map(|&b| b as f32)),
-            Dtype::I32 => {
-                for c in raw.chunks_exact(4) {
-                    out.push(i32::from_le_bytes(c.try_into().unwrap()) as f32);
-                }
-            }
-            Dtype::I64 | Dtype::Bool => {
-                return Err(Error::Format(format!(
-                    "{name}: {:?} cannot be read as f32",
-                    t.dtype
-                )))
-            }
+        // `I64`/`Bool` are rejected before anything is allocated, so an
+        // unreadable dtype does not cost a multi-gigabyte zeroed buffer first.
+        if matches!(t.dtype, Dtype::I64 | Dtype::Bool) {
+            return Err(Error::Format(format!(
+                "{name}: {:?} cannot be read as f32",
+                t.dtype
+            )));
         }
 
-        debug_assert_eq!(out.len(), n);
+        let width = t.dtype.size();
+        let mut out = vec![0f32; n];
+        const STRIP: usize = 1 << 16;
+
+        out.par_chunks_mut(STRIP)
+            .zip(raw.par_chunks(STRIP * width))
+            .for_each(|(dst, src)| match t.dtype {
+                Dtype::F32 => {
+                    for (d, c) in dst.iter_mut().zip(src.chunks_exact(4)) {
+                        *d = f32::from_le_bytes(c.try_into().unwrap());
+                    }
+                }
+                Dtype::F16 => {
+                    for (d, c) in dst.iter_mut().zip(src.chunks_exact(2)) {
+                        *d = half::f16::from_le_bytes(c.try_into().unwrap()).to_f32();
+                    }
+                }
+                Dtype::BF16 => {
+                    // bf16 is the top 16 bits of an f32, so widening is a shift.
+                    for (d, c) in dst.iter_mut().zip(src.chunks_exact(2)) {
+                        let bits = u16::from_le_bytes(c.try_into().unwrap());
+                        *d = f32::from_bits((bits as u32) << 16);
+                    }
+                }
+                Dtype::I8 => {
+                    for (d, &b) in dst.iter_mut().zip(src) {
+                        *d = b as i8 as f32;
+                    }
+                }
+                Dtype::U8 => {
+                    for (d, &b) in dst.iter_mut().zip(src) {
+                        *d = b as f32;
+                    }
+                }
+                Dtype::I32 => {
+                    for (d, c) in dst.iter_mut().zip(src.chunks_exact(4)) {
+                        *d = i32::from_le_bytes(c.try_into().unwrap()) as f32;
+                    }
+                }
+                Dtype::I64 | Dtype::Bool => unreachable!("rejected above"),
+            });
+
         Ok(out)
     }
 
