@@ -233,6 +233,9 @@ extern "C" {
         head_dim: i32,
         pos: *const c_void,
         max_seq: i32,
+        q_norm_w: *const c_void,
+        k_norm_w: *const c_void,
+        eps: f32,
     ) -> i32;
 
     #[allow(clippy::too_many_arguments)]
@@ -345,6 +348,54 @@ extern "C" {
         eps: f32,
     ) -> i32;
 
+    pub(crate) fn wst_head_threshold(
+        logits: *const c_void,
+        n: i32,
+        k: i32,
+        cap: i32,
+        scratch: *mut c_void,
+        nblocks: i32,
+        out_thresh: *mut c_void,
+        out_count: *mut c_void,
+    ) -> i32;
+
+    pub(crate) fn wst_head_compact(
+        logits: *const c_void,
+        n: i32,
+        thresh: *const c_void,
+        count: *mut c_void,
+        out_idx: *mut c_void,
+        cap: i32,
+    ) -> i32;
+
+    pub(crate) fn wst_head_rescore(
+        head: *const c_void,
+        x: *const c_void,
+        idx: *const c_void,
+        count: *const c_void,
+        logits: *mut c_void,
+        hidden: i32,
+        cap: i32,
+        grid: i32,
+    ) -> i32;
+
+    pub(crate) fn wst_moe_router(
+        logits: *const c_void,
+        n_experts: i32,
+        k: i32,
+        norm_topk: i32,
+        out_idx: *mut c_void,
+        out_w: *mut c_void,
+    ) -> i32;
+
+    pub(crate) fn wst_moe_accumulate(
+        dst: *mut c_void,
+        src: *const c_void,
+        weights: *const c_void,
+        slot: i32,
+        n: i32,
+    ) -> i32;
+
     pub(crate) fn wst_rope_cache_chunk(
         qkv: *mut c_void,
         k_cache: *mut c_void,
@@ -357,6 +408,9 @@ extern "C" {
         pos0: i32,
         n: i32,
         max_seq: i32,
+        q_norm_w: *const c_void,
+        k_norm_w: *const c_void,
+        eps: f32,
     ) -> i32;
 
     pub(crate) fn wst_attn_chunk(

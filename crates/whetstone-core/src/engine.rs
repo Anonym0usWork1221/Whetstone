@@ -525,7 +525,14 @@ impl Engine {
 
             layer.qkv_proj.forward(&a.h, layer.qkv_bias.as_ref(), &mut a.qkv, false)?;
 
-            decode::rope_cache(&mut a.qkv, &mut self.caches[l], &self.rope, n_q, &a.pos_dev)?;
+            decode::rope_cache(
+                &mut a.qkv,
+                &mut self.caches[l],
+                &self.rope,
+                n_q,
+                &a.pos_dev,
+                layer.qk_norm(eps),
+            )?;
             decode::attn_decode(&a.qkv, &mut self.caches[l], &mut a.attn, n_q, &a.pos_dev)?;
 
             // Accumulating GEMV: the projection adds straight into the residual
@@ -545,6 +552,15 @@ impl Engine {
         match &self.weights.lm_head {
             Some(head) => head.forward(&a.h, None, &mut a.logits, false)?,
             None => self.weights.embed.project(&a.h, &mut a.logits)?,
+        }
+
+        // Recompute the leaders from the fp16 head copy, if the file carries
+        // one. Three fixed-shape launches reading their data-dependent count
+        // from device memory, so this stays inside the captured decode graph.
+        // `a.h` is the same activation the quantized GEMV just consumed, so the
+        // only difference in the new logits is weight precision.
+        if let Some(rs) = self.weights.head_rescore.as_mut() {
+            rs.apply(&mut a.logits, &a.h)?;
         }
         launches += 2;
 
@@ -779,7 +795,15 @@ impl Engine {
             whetstone_kernels::chunk::rmsnorm_eps(&ch.x, &layer.input_norm, &mut ch.h, hidden, n, eps)?;
             layer.qkv_proj.forward_chunk(&ch.h, layer.qkv_bias.as_ref(), &mut ch.qkv, n, false)?;
 
-            whetstone_kernels::chunk::rope_cache(&mut ch.qkv, &mut caches[l], rope, n_q, pos0, n)?;
+            whetstone_kernels::chunk::rope_cache(
+                &mut ch.qkv,
+                &mut caches[l],
+                rope,
+                n_q,
+                pos0,
+                n,
+                layer.qk_norm(eps),
+            )?;
             whetstone_kernels::chunk::attn(&ch.qkv, &caches[l], &mut ch.attn, n_q, pos0, n)?;
 
             layer.o_proj.forward_chunk(&ch.attn, None, &mut ch.x, n, true)?;

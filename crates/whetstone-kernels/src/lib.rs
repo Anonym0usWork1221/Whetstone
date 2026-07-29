@@ -17,10 +17,22 @@ use std::ffi::{c_char, c_void, CStr};
 use std::fmt;
 use std::marker::PhantomData;
 
+/// The GPU architectures this binary carries device code for, comma separated,
+/// as resolved by `build.rs` — **not** the `WHETSTONE_CUDA_ARCH` request string.
+///
+/// `--version` prints this. The distinction matters: the request may be "all",
+/// "native", or a list the toolkit could not fully honour, and a bug report that
+/// says `sm_all` or claims a fat binary is `sm_75` is worse than no field at all.
+/// It lives here because `env!` only sees a `cargo:rustc-env` emitted by *this*
+/// crate's build script.
+pub const CUDA_ARCH_LIST: &str = env!("WHETSTONE_CUDA_ARCH_LIST");
+
 pub mod chunk;
 pub mod decode;
 mod ffi;
 pub mod gemv;
+pub mod moe;
+pub mod rescore;
 
 pub use decode::{
     argmax, attn_decode, embed_fp16, embed_int4, nll, rmsnorm, rope_cache, stream_sync, swiglu,
@@ -600,7 +612,16 @@ mod tests {
             p.fp16_wmma_tflops, p.int8_wmma_tops, p.int4_wmma_tops,
             p.bin_bmma_tops, p.dp4a_tops, p.popc_tops
         );
-        assert!(p.fp16_wmma_tflops > 0.0);
+        // Not every architecture in the fat binary has tensor cores: sm_60 and
+        // sm_61 report -1.0 by design, and asserting unconditionally would fail
+        // this test on cards the build deliberately ships images for. `popc` is
+        // the only path with no arch gate at all, so it is the one thing that
+        // must always be measurable.
+        assert!(p.popc_tops > 0.0, "popc is available on every architecture");
+        if p.fp16_wmma_tflops <= 0.0 {
+            eprintln!("skip ratio checks: no fp16 tensor cores on this device");
+            return;
+        }
 
         if d.info().has_bmma_xor != 0 {
             assert!(p.bin_bmma_tops > p.fp16_wmma_tflops,

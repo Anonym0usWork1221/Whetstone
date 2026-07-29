@@ -185,6 +185,12 @@ impl Header {
         self.tensors
             .iter()
             .filter(|t| t.name != "model.embed_tokens.weight" || self.tied())
+            // The top-k rescore's fp16 head copy is resident in VRAM but only a
+            // few dozen of its rows are read per token, so counting it here
+            // would double the reported bytes/token and invert the very trade
+            // the feature exists to make: it spends VRAM, which is not binding,
+            // to buy back bandwidth, which is.
+            .filter(|t| !t.name.ends_with(RESCORE_SUFFIX))
             .map(TensorEntry::stored_bytes)
             .sum()
     }
@@ -196,6 +202,13 @@ impl Header {
             .unwrap_or(false)
     }
 }
+
+/// Marks a tensor that is resident but not streamed per token.
+///
+/// Currently only the fp16 `lm_head` copy the top-k rescore reads a few rows of.
+/// The suffix is load-bearing: [`Header::decode_resident_bytes`] filters on it,
+/// and the roofline numbers this project reasons with are that function.
+pub const RESCORE_SUFFIX: &str = ".rescore";
 
 /// FNV-1a-shaped, 64-bit. **The multiplier is not the FNV-1a prime.**
 ///

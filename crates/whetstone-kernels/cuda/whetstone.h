@@ -218,9 +218,14 @@ wst_status_t wst_rmsnorm(const void *x, const void *w, void *out, int32_t n, flo
  *   v_cache  : same
  *   cos, sin : [max_seq][head_dim/2] float, precomputed in f64 on the host
  */
+/* `q_norm_w` / `k_norm_w` are the per-head RMSNorm gains of Qwen3, OLMo2 and
+ * Gemma2: `head_dim` halves each, or NULL for families without QK-norm. The
+ * norm is applied to the head vector *before* the rotation, which is why it
+ * lives in this kernel rather than its own. */
 wst_status_t wst_rope_cache(void *qkv, void *k_cache, void *v_cache, const void *cos_tab,
                             const void *sin_tab, int32_t n_q, int32_t n_kv,
-                            int32_t head_dim, const void *pos, int32_t max_seq);
+                            int32_t head_dim, const void *pos, int32_t max_seq,
+                            const void *q_norm_w, const void *k_norm_w, float eps);
 
 /* Batch=1 GQA attention against the KV cache.
  *
@@ -313,10 +318,45 @@ wst_status_t wst_gemm_fp16(const void *w, const void *x, const void *bias, void 
 
 wst_status_t wst_rmsnorm_chunk(const void *x, const void *w, void *out, int32_t dim,
                                int32_t n, float eps);
+/* ------------------------------------------------------ top-k head rescore */
+
+/* Recompute the largest logits from an fp16 copy of `lm_head`, after the
+ * quantized head has produced all of them. Measured to remove 82% of the head's
+ * quantization damage at k=64 for 0.17% more bandwidth.
+ *
+ * Three fixed-shape launches so the whole thing stays inside the captured decode
+ * graph: pick a threshold, compact the ids above it, rescore those rows. The
+ * count lives in device memory and blocks past it return immediately. */
+wst_status_t wst_head_threshold(const void *logits, int32_t n, int32_t k, int32_t cap,
+                                void *scratch, int32_t nblocks, void *out_thresh,
+                                void *out_count);
+wst_status_t wst_head_compact(const void *logits, int32_t n, const void *thresh,
+                              void *count, void *out_idx, int32_t cap);
+wst_status_t wst_head_rescore(const void *head, const void *x, const void *idx,
+                              const void *count, void *logits, int32_t hidden,
+                              int32_t cap, int32_t grid);
+
+/* ------------------------------------------------------- mixture of experts */
+
+/* Softmax over all `n_experts` logits, then the `k` largest, written to device
+ * memory so the expert GEMV can read its row offset without a host round-trip
+ * (and so the whole step stays capturable as one CUDA graph).
+ *
+ * `norm_topk` renormalises the k weights to sum to 1: Qwen3-MoE and Mixtral do,
+ * OLMoE does not. `out_idx` holds k int32, `out_w` k floats. */
+wst_status_t wst_moe_router(const void *logits, int32_t n_experts, int32_t k,
+                            int32_t norm_topk, void *out_idx, void *out_w);
+
+/* dst[i] += weights[slot] * src[i]. The scalar is a device pointer for the same
+ * graph-capture reason. */
+wst_status_t wst_moe_accumulate(void *dst, const void *src, const void *weights,
+                                int32_t slot, int32_t n);
+
 wst_status_t wst_rope_cache_chunk(void *qkv, void *k_cache, void *v_cache,
                                   const void *cos_tab, const void *sin_tab, int32_t n_q,
                                   int32_t n_kv, int32_t head_dim, int32_t pos0, int32_t n,
-                                  int32_t max_seq);
+                                  int32_t max_seq, const void *q_norm_w,
+                                  const void *k_norm_w, float eps);
 wst_status_t wst_attn_chunk(const void *qkv, const void *k_cache, const void *v_cache,
                             void *out, int32_t n_q, int32_t n_kv, int32_t head_dim,
                             int32_t pos0, int32_t n, int32_t max_seq, float scale);

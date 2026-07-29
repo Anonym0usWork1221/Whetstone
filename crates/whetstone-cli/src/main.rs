@@ -15,16 +15,29 @@ mod verify;
 
 /// Version string including build provenance.
 ///
-/// A released binary compiles for exactly one GPU architecture, so the arch is
-/// as much a part of its identity as the version number.
+/// A released binary carries device code for several GPU architectures plus a
+/// PTX tail, and *which* ones is as much a part of its identity as the version
+/// number — a bug report from an unsupported card is otherwise unactionable.
 fn long_version() -> &'static str {
-    concat!(
-        env!("CARGO_PKG_VERSION"),
-        "\ncommit:     ", env!("WHETSTONE_GIT_SHA"),
-        "\nbuilt:      ", env!("WHETSTONE_BUILD_DATE"),
-        "\ntarget:     ", env!("WHETSTONE_TARGET"),
-        "\ncuda arch:  sm_", env!("WHETSTONE_CUDA_ARCH"),
-    )
+    // Built at run time rather than with `concat!`, because the architecture
+    // list is a `const` in `whetstone-kernels` (the only crate whose build
+    // script knows it) and `concat!` takes literals only.
+    static V: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    V.get_or_init(|| {
+        let arches: Vec<String> = whetstone_kernels::CUDA_ARCH_LIST
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .map(|a| format!("sm_{a}"))
+            .collect();
+        format!(
+            "{}\ncommit:     {}\nbuilt:      {}\ntarget:     {}\ncuda arch:  {} (+PTX)",
+            env!("CARGO_PKG_VERSION"),
+            env!("WHETSTONE_GIT_SHA"),
+            env!("WHETSTONE_BUILD_DATE"),
+            env!("WHETSTONE_TARGET"),
+            arches.join(", "),
+        )
+    })
 }
 
 #[derive(Parser)]
@@ -36,6 +49,13 @@ fn long_version() -> &'static str {
     after_help = "Docs: https://github.com/Anonym0usWork1221/Whetstone"
 )]
 struct Cli {
+    /// Worker threads for the CPU-side work (conversion, quantization).
+    ///
+    /// Defaults to one per logical core. Lower it to leave the machine usable
+    /// during a long convert, or to get a clean single-threaded timing.
+    #[arg(long, short = 'j', global = true)]
+    jobs: Option<usize>,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -77,6 +97,15 @@ enum Command {
         /// Memory bandwidth in GB/s for the reported ceiling.
         #[arg(long)]
         bandwidth: Option<f64>,
+        /// Also store an fp16 copy of the output projection, so the largest
+        /// logits can be recomputed exactly at decode time.
+        ///
+        /// Measured on Qwen2.5-0.5B with an int4 head: this removes 82% of the
+        /// head's quantization damage (+0.52 -> +0.10 perplexity) for 0.17% more
+        /// bandwidth. The cost is VRAM -- 272 MB on the 0.5B -- which is the
+        /// resource that is not binding.
+        #[arg(long)]
+        head_rescore: bool,
     },
 
     /// Check a `.wstone` file's integrity, and optionally its fidelity.
@@ -289,15 +318,28 @@ enum Command {
 }
 
 fn main() -> Result<()> {
-    match Cli::parse().command {
+    let cli = Cli::parse();
+
+    // Sizing the global pool has to happen before anything touches it -- rayon
+    // builds the default pool lazily on first use and a second `build_global`
+    // is an error, not an override.
+    if let Some(j) = cli.jobs {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(j)
+            .build_global()
+            .context("could not size the worker pool")?;
+    }
+
+    match cli.command {
         Command::Probe { iters, bandwidth_mib } => {
             probe::run(iters, bandwidth_mib).context("probe failed")
         }
         Command::Inspect { model, bandwidth, tensors } => {
             inspect::run(&model, bandwidth, tensors).context("inspect failed")
         }
-        Command::Convert { model, out, head, body, bandwidth } => {
-            convert::run(&model, &out, head, body, bandwidth).context("convert failed")
+        Command::Convert { model, out, head, body, bandwidth, head_rescore } => {
+            convert::run(&model, &out, head, body, bandwidth, head_rescore)
+                .context("convert failed")
         }
         Command::Verify { file, source, bandwidth } => {
             verify::run(&file, source.as_deref(), bandwidth).context("verify failed")

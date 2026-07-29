@@ -267,6 +267,19 @@ impl Embedding {
     }
 }
 
+/// The per-head RMSNorm gains of the QK-norm families, resident on the device.
+///
+/// One `head_dim` vector for queries and one for keys, shared across every head
+/// in the layer. Both or neither: a checkpoint with only one is rejected at
+/// load, because running without the norm produces fluent, wrong text rather
+/// than an error.
+pub struct QkNormWeights {
+    /// Query gain, `head_dim` fp16 entries, shared by every query head.
+    pub q: DeviceBuffer<u16>,
+    /// Key gain, `head_dim` fp16 entries, shared by every key head.
+    pub k: DeviceBuffer<u16>,
+}
+
 /// One transformer block's weights.
 ///
 /// The q/k/v and gate/up projections are **concatenated at load time** into
@@ -296,6 +309,9 @@ pub struct LayerWeights {
     pub qkv_proj: DeviceLinear,
     /// The three q/k/v biases concatenated, when the architecture has them.
     pub qkv_bias: Option<DeviceBuffer<u16>>,
+    /// Per-head RMSNorm gains applied to q and k before RoPE. `Some` only for
+    /// the QK-norm families (Qwen3, Qwen3-MoE, OLMo2, Gemma2).
+    pub qk_norm: Option<QkNormWeights>,
     /// Output projection. Writes into the residual stream.
     pub o_proj: DeviceLinear,
 
@@ -306,6 +322,18 @@ pub struct LayerWeights {
 }
 
 impl LayerWeights {
+    /// This layer's QK-norm gains in the form the RoPE kernels take, or `None`
+    /// for a family without them.
+    ///
+    /// `eps` comes from the caller because it is a model-wide constant and
+    /// duplicating it per layer would be 28 copies of one float that must never
+    /// disagree.
+    pub fn qk_norm(&self, eps: f32) -> Option<whetstone_kernels::decode::QkNorm<'_>> {
+        self.qk_norm
+            .as_ref()
+            .map(|n| whetstone_kernels::decode::QkNorm { q: &n.q, k: &n.k, eps })
+    }
+
     /// Weight bytes this block streams per token.
     pub fn bytes(&self) -> usize {
         self.qkv_proj.bytes() + self.o_proj.bytes() + self.gate_up_proj.bytes()
@@ -325,6 +353,12 @@ pub struct ModelWeights {
     pub embed: Embedding,
     /// A separate `lm_head`, present only when embeddings are untied.
     pub lm_head: Option<DeviceLinear>,
+    /// Exact recomputation of the largest logits, when the file carries an fp16
+    /// copy of the output projection (`convert --head-rescore`).
+    ///
+    /// Resident in VRAM, but only the few dozen winning rows are read per token,
+    /// so it is excluded from the roofline denominator by design.
+    pub head_rescore: Option<whetstone_kernels::rescore::HeadRescore>,
     /// Provenance from the header: quantization scheme, source path, and so on.
     pub quant_meta: std::collections::BTreeMap<String, String>,
     /// The source `tokenizer.json`, when the converter embedded one.
@@ -509,6 +543,7 @@ impl ModelWeights {
                         config.n_kv_heads() * config.head_dim(),
                     ],
                 )?,
+                qk_norm: load_qk_norm(&header, bytes, &p, config.head_dim())?,
                 o_proj: load_linear(&header, bytes, &format!("{p}.self_attn.o_proj.weight"))?,
                 gate_up_proj: fuse_linears(
                     &header,
@@ -578,6 +613,13 @@ impl ModelWeights {
             None => None,
         };
 
+        // Whichever tensor is the *output* projection is the one with a copy:
+        // for an untied model that is `lm_head.weight`, for a tied one the
+        // embedding doubles as it.
+        let head_name =
+            if lm_head.is_some() { "lm_head.weight" } else { "model.embed_tokens.weight" };
+        let head_rescore = load_head_rescore(&header, bytes, head_name)?;
+
         Ok(Self {
             residency: Residency {
                 device_layers,
@@ -589,6 +631,7 @@ impl ModelWeights {
             final_norm,
             embed,
             lm_head,
+            head_rescore,
             quant_meta: header.quant,
             tokenizer_json,
         })
@@ -725,6 +768,80 @@ fn load_fp16(h: &Header, bytes: &[u8], name: &str) -> Result<DeviceBuffer<u16>> 
         )));
     }
     Ok(DeviceBuffer::from_slice(&data)?)
+}
+
+/// Loads a layer's QK-norm gains, or `None` if the family has no QK-norm.
+///
+/// Half a pair is an error rather than a silent fallback. A checkpoint carrying
+/// `q_norm` but not `k_norm` is malformed, and skipping the norm entirely would
+/// run and produce fluent, wrong text -- the exact failure this whole path
+/// exists to make impossible.
+fn load_qk_norm(
+    h: &Header,
+    bytes: &[u8],
+    prefix: &str,
+    head_dim: usize,
+) -> Result<Option<QkNormWeights>> {
+    let q = load_fp16_opt(h, bytes, &format!("{prefix}.self_attn.q_norm.weight"))?;
+    let k = load_fp16_opt(h, bytes, &format!("{prefix}.self_attn.k_norm.weight"))?;
+    match (q, k) {
+        (None, None) => Ok(None),
+        (Some(q), Some(k)) => {
+            if q.len() != head_dim || k.len() != head_dim {
+                return Err(Error::Shape(format!(
+                    "{prefix}: QK-norm gains are q[{}], k[{}]; both must be head_dim {head_dim}",
+                    q.len(),
+                    k.len()
+                )));
+            }
+            Ok(Some(QkNormWeights { q, k }))
+        }
+        (q, _) => Err(Error::Format(format!(
+            "{prefix}: has {} but not the other. QK-norm needs both gains; one \
+             alone means the checkpoint or the conversion is incomplete, and \
+             running without it would generate fluent, wrong text.",
+            if q.is_some() { "q_norm" } else { "k_norm" }
+        ))),
+    }
+}
+
+/// Rows the top-k rescore recomputes exactly per token.
+///
+/// 64 is measured, not chosen: on Qwen2.5-0.5B with an int4-hier head it removes
+/// 82% of the head's quantization damage (+0.5186 -> +0.0957 perplexity) for
+/// 0.17% more bandwidth. k=16 leaves too much (+0.1595) and k=256 buys only
+/// another 0.03 for four times the work.
+const HEAD_RESCORE_K: usize = 64;
+
+/// Builds the rescore from the fp16 head copy, if the file carries one.
+///
+/// The blob is named `<head>.rescore` and is deliberately excluded from
+/// `decode_resident_bytes`: it sits in VRAM but only a few dozen of its rows are
+/// read per token, which is the entire trade.
+fn load_head_rescore(
+    h: &Header,
+    bytes: &[u8],
+    head_name: &str,
+) -> Result<Option<whetstone_kernels::rescore::HeadRescore>> {
+    let name = format!("{head_name}{}", format::RESCORE_SUFFIX);
+    let Ok(t) = h.tensor(&name) else {
+        return Ok(None);
+    };
+    let (vocab, hidden) = match t.shape.as_slice() {
+        [v, hd] => (*v, *hd),
+        other => {
+            return Err(Error::Shape(format!(
+                "{name}: expected a 2-D head copy, found {other:?}"
+            )))
+        }
+    };
+    let data = as_u16(blob_bytes(bytes, t, "data")?);
+    Ok(Some(whetstone_kernels::rescore::HeadRescore::new(
+        &data,
+        vocab,
+        hidden,
+        HEAD_RESCORE_K,
+    )?))
 }
 
 fn load_fp16_opt(h: &Header, bytes: &[u8], name: &str) -> Result<Option<DeviceBuffer<u16>>> {
