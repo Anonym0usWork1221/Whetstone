@@ -9,7 +9,19 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 
-/// A Qwen2-family model configuration, as parsed from `config.json`.
+/// A transformer configuration, as parsed from `config.json`.
+///
+/// Whetstone executes one block shape: pre-norm RMSNorm, RoPE, grouped-query
+/// attention, SwiGLU. That covers far more than one family — Qwen2/2.5,
+/// Llama 2/3.x, Mistral, and every distillation onto those skeletons differ only
+/// in *numbers* (widths, head counts, whether q/k/v carry biases, how the RoPE
+/// frequencies are stretched), not in the operations executed. [`Architecture`]
+/// records the handful of switches that do differ, so adding a family that fits
+/// the shape is a table entry rather than surgery.
+///
+/// Families that do **not** fit the shape need real work, and pretending
+/// otherwise by loosening the check would produce fluent, wrong output — see
+/// [`Architecture::detect`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelConfig {
     /// Model family identifier, e.g. `"qwen2"`.
@@ -46,6 +58,75 @@ pub struct ModelConfig {
     /// Explicit head dimension, when the config overrides `hidden/heads`.
     #[serde(default)]
     pub head_dim: Option<usize>,
+    /// RoPE frequency scaling, when the model stretches its context.
+    #[serde(default)]
+    pub rope_scaling: Option<RopeScalingConfig>,
+}
+
+/// The `rope_scaling` block, as several families spell it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RopeScalingConfig {
+    /// `"llama3"`, `"linear"`, `"dynamic"`, `"yarn"`. Older configs use `type`.
+    #[serde(alias = "type", default)]
+    pub rope_type: String,
+    /// Context multiplier.
+    #[serde(default)]
+    pub factor: Option<f64>,
+    /// Llama 3 low-frequency cutoff.
+    #[serde(default)]
+    pub low_freq_factor: Option<f64>,
+    /// Llama 3 high-frequency cutoff.
+    #[serde(default)]
+    pub high_freq_factor: Option<f64>,
+    /// The context the model was trained at, before stretching.
+    #[serde(default)]
+    pub original_max_position_embeddings: Option<usize>,
+}
+
+/// The switches that differ between families sharing Whetstone's block shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Architecture {
+    /// q/k/v projections carry a bias term. Qwen2 yes, Llama/Mistral no.
+    pub qkv_bias: bool,
+    /// Per-head RMSNorm on q and k before RoPE. Qwen3, Gemma2, OLMo2.
+    ///
+    /// **Not implemented.** Recorded so the loader can refuse rather than run.
+    pub qk_norm: bool,
+}
+
+impl ModelConfig {
+    /// What this config implies about the block, or why it cannot be executed.
+    ///
+    /// The check is deliberately a whitelist of *families*, not a structural
+    /// probe, because the failure mode of guessing wrong is not a crash. A
+    /// mixture-of-experts config parses perfectly as a dense one — it simply has
+    /// `num_experts` fields this struct ignores — and would load, run, and emit
+    /// fluent text produced by a fraction of the model. Refusing by name is the
+    /// only version of this check that fails loudly.
+    pub fn architecture(&self) -> Result<Architecture> {
+        let fam = self.model_type.as_str();
+        let known = matches!(
+            fam,
+            "" | "qwen2" | "qwen3" | "llama" | "mistral" | "smollm" | "smollm2" | "olmo2"
+        );
+        if !known {
+            return Err(Error::Config(format!(
+                "unsupported model_type {fam:?}.\n\
+                 Whetstone executes one block shape -- pre-norm RMSNorm, RoPE, \
+                 grouped-query attention, SwiGLU -- which covers qwen2, qwen3, \
+                 llama, mistral and their distillations.\n\
+                 Families outside it need real work rather than a looser check: \
+                 mixture-of-experts (mixtral, qwen3_moe, deepseek_v2/v3, glm4_moe, \
+                 kimi) needs expert routing, and DeepSeek-V2/V3 and Kimi also \
+                 replace attention with MLA. A config for any of those parses \
+                 fine as a dense model and would generate plausible, wrong text."
+            )));
+        }
+        Ok(Architecture {
+            qkv_bias: matches!(fam, "qwen2" | "qwen3" | ""),
+            qk_norm: matches!(fam, "qwen3" | "olmo2"),
+        })
+    }
 }
 
 fn default_rms_eps() -> f32 {
@@ -105,11 +186,27 @@ impl ModelConfig {
                 self.hidden_act
             )));
         }
-        if !self.model_type.is_empty() && self.model_type != "qwen2" && self.model_type != "qwen3" {
+        let arch = self.architecture()?;
+        if arch.qk_norm {
             return Err(Error::Config(format!(
-                "unsupported model_type {:?}; Whetstone targets qwen2/qwen3 layer topology",
+                "{:?} applies RMSNorm to the query and key head vectors before \
+                 RoPE (QK-norm), which Whetstone's attention does not implement.\n\
+                 The layer topology otherwise matches, so this would load and run \
+                 and generate fluent text that is quantitatively wrong -- which is \
+                 why it is refused instead.",
                 self.model_type
             )));
+        }
+        if let Some(rs) = &self.rope_scaling {
+            let t = rs.rope_type.as_str();
+            if !matches!(t, "" | "default" | "llama3") {
+                return Err(Error::Config(format!(
+                    "rope_scaling type {t:?} is not implemented; Whetstone \
+                     supports the llama3 schedule and unscaled RoPE. Running \
+                     without it degrades coherence past the trained context \
+                     rather than failing, so it is refused."
+                )));
+            }
         }
         Ok(())
     }
@@ -372,6 +469,67 @@ mod tests {
         let mha = 2 * c.num_hidden_layers * c.num_attention_heads * c.head_dim() * 4096 * 2;
         assert_eq!(mha / gqa, 7);
         assert_eq!(gqa, 2 * 24 * 2 * 64 * 4096 * 2);
+    }
+
+    fn llama_shaped_config(model_type: &str) -> serde_json::Value {
+        serde_json::json!({
+            "model_type": model_type,
+            "hidden_size": 2048, "num_hidden_layers": 16,
+            "num_attention_heads": 32, "num_key_value_heads": 8,
+            "intermediate_size": 8192, "vocab_size": 128256,
+            "rope_theta": 500000.0, "tie_word_embeddings": true,
+        })
+    }
+
+    #[test]
+    fn families_sharing_the_block_shape_are_accepted() {
+        // Llama 3.x, Mistral and their distillations differ from Qwen2 in
+        // widths and whether q/k/v carry biases -- not in the operations the
+        // engine executes. Rejecting them was a whitelist that had fallen behind
+        // what the kernels actually support.
+        for fam in ["qwen2", "llama", "mistral", "smollm2"] {
+            let c: ModelConfig = serde_json::from_value(llama_shaped_config(fam)).unwrap();
+            c.validate().unwrap_or_else(|e| panic!("{fam} should be supported: {e}"));
+            let a = c.architecture().unwrap();
+            assert_eq!(a.qkv_bias, fam == "qwen2", "{fam} qkv_bias");
+        }
+    }
+
+    #[test]
+    fn architectures_that_would_run_and_be_wrong_are_refused() {
+        // The failure mode these guard against is not a crash. A
+        // mixture-of-experts config parses perfectly as a dense one -- it just
+        // carries fields this struct ignores -- so without the check it would
+        // load, run, and generate fluent text from a fraction of the model.
+        for fam in ["mixtral", "qwen3_moe", "deepseek_v2", "deepseek_v3", "glm4_moe"] {
+            let c: ModelConfig = serde_json::from_value(llama_shaped_config(fam)).unwrap();
+            let e = c.validate().expect_err("{fam} must be refused").to_string();
+            assert!(e.contains("unsupported model_type"), "{fam}: {e}");
+        }
+
+        // Qwen3 passes the family check and is refused a step later, on QK-norm.
+        let c: ModelConfig = serde_json::from_value(llama_shaped_config("qwen3")).unwrap();
+        let e = c.validate().expect_err("qwen3 must be refused").to_string();
+        assert!(e.contains("QK-norm"), "{e}");
+    }
+
+    #[test]
+    fn unimplemented_rope_scaling_is_refused_rather_than_ignored() {
+        // Silently ignoring it does not fail -- it degrades coherence past the
+        // trained context, which reads as the model being bad at long inputs.
+        let mut v = llama_shaped_config("llama");
+        v["rope_scaling"] = serde_json::json!({"rope_type": "yarn", "factor": 4.0});
+        let c: ModelConfig = serde_json::from_value(v).unwrap();
+        assert!(c.validate().is_err());
+
+        let mut v = llama_shaped_config("llama");
+        v["rope_scaling"] = serde_json::json!({
+            "rope_type": "llama3", "factor": 32.0,
+            "low_freq_factor": 1.0, "high_freq_factor": 4.0,
+            "original_max_position_embeddings": 8192
+        });
+        let c: ModelConfig = serde_json::from_value(v).unwrap();
+        c.validate().expect("the llama3 schedule is implemented");
     }
 
     #[test]

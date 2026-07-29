@@ -20,6 +20,7 @@
 
 #![deny(missing_docs)]
 
+pub mod checkpoint;
 pub mod config;
 pub mod engine;
 pub mod error;
@@ -27,8 +28,9 @@ pub mod model;
 pub mod safetensors;
 pub mod tokenizer;
 
-pub use config::{ModelConfig, Roofline};
-pub use engine::{Engine, Profile, RunStats, Sampler};
+pub use checkpoint::Checkpoint;
+pub use config::{Architecture, ModelConfig, Roofline, RopeScalingConfig};
+pub use engine::{Engine, Profile, RunStats, Sampler, SamplingConfig};
 pub use error::{Error, Result};
 pub use model::{DeviceLinear, Embedding, LayerWeights, ModelWeights};
 pub use safetensors::{Dtype, SafeTensors, TensorView};

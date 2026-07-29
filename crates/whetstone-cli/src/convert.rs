@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
-use whetstone_core::{ModelConfig, SafeTensors};
+use whetstone_core::{Checkpoint, ModelConfig};
 use whetstone_quant::{
     format, quantize_int4_g128, quantize_int4_hier, relative_error, PackedInt4,
     PackedInt4Hier,
@@ -68,14 +68,33 @@ pub fn run(
     let cfg = ModelConfig::from_dir(model_dir)
         .with_context(|| format!("could not load config from {}", model_dir.display()))?;
 
-    let weights = model_dir.join("model.safetensors");
-    if !weights.exists() {
-        bail!("no model.safetensors in {}", model_dir.display());
+    let st = Checkpoint::open(model_dir)?;
+    if st.shard_count() > 1 {
+        println!("  reading {} shards", st.shard_count());
     }
-    let st = SafeTensors::open(&weights)?;
 
     let raw_config: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(model_dir.join("config.json"))?)?;
+
+    // Qwen3 applies RMSNorm to the query and key head vectors before RoPE.
+    // Whetstone's attention does not implement that, and `ModelConfig` accepts
+    // `model_type == "qwen3"` because the *layer topology* matches. So a Qwen3
+    // checkpoint would convert, load, run, and emit fluent, wrong text -- the
+    // worst failure mode available, because nothing about it looks like a bug.
+    //
+    // Detect it from the tensor names rather than the config, since that is what
+    // actually decides whether the arithmetic is right.
+    if st.get("model.layers.0.self_attn.q_norm.weight").is_ok()
+        || st.get("model.layers.0.self_attn.k_norm.weight").is_ok()
+    {
+        bail!(
+            "this checkpoint has per-head q_norm/k_norm (QK-RMSNorm), which \
+             Whetstone's attention does not implement.\n\
+             Converting it would produce a model that runs and generates fluent \
+             text that is quantitatively wrong, so it is refused instead.\n\
+             Qwen2.5 and Llama-style checkpoints do not use it."
+        );
+    }
 
     println!("{:=<72}", "");
     println!("  converting {}", model_dir.display());
@@ -113,7 +132,10 @@ pub fn run(
             _ => "rtn",
         },
     );
-    w.set_quant_meta("source", &weights.display().to_string());
+    w.set_quant_meta(
+        "source",
+        &st.files().first().map(|p| p.display().to_string()).unwrap_or_default(),
+    );
     w.set_quant_meta(
         "lm_head",
         match head {
@@ -239,9 +261,40 @@ pub fn run(
         }
     }
 
+    // Untied models carry a separate output projection, and **that** is the one
+    // that is 27.6% of decode traffic -- the input embedding is a single-row
+    // gather. Earlier versions applied `--head` to `embed_tokens` and copied
+    // `lm_head` as dense fp16, which is exactly backwards: it spent quality on
+    // the tensor that costs no bandwidth and left the expensive one at 16 bits.
+    // On Qwen2.5-7B that is a 1.09 GB fp16 matrix against 291 MB quantized,
+    // which is the difference between fitting in 6 GB and not.
     if !cfg.tie_word_embeddings && st.get("lm_head.weight").is_ok() {
-        copy_dense(&st, &mut w, "lm_head.weight")?;
-        n_dense += 1;
+        let t = st.get("lm_head.weight")?;
+        let (out_f, in_f) = t.shape_2d()?;
+        let h32 = st.to_f32("lm_head.weight")?;
+        match head {
+            HeadPrecision::Int4Hier if in_f % whetstone_quant::HGROUP == 0 => {
+                let packed = quantize_int4_hier(&h32, in_f, out_f)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                let e = report_error_hier(&h32, &packed);
+                println!("  lm_head (untied) quantized to int4-hier-g32, rel. error {e:.4}");
+                w.write_int4_hier("lm_head.weight", &packed)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                n_quant += 1;
+            }
+            HeadPrecision::Int4 if in_f % whetstone_quant::GROUP == 0 => {
+                let packed = quantize_int4_g128(&h32, in_f, out_f)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                let e = report_error(&h32, &packed);
+                println!("  lm_head (untied) quantized to int4-g128, rel. error {e:.4}");
+                w.write_int4("lm_head.weight", &packed).map_err(|e| anyhow::anyhow!("{e}"))?;
+                n_quant += 1;
+            }
+            _ => {
+                write_fp16(&mut w, "lm_head.weight", &h32, &[out_f, in_f])?;
+                n_dense += 1;
+            }
+        }
     }
 
     // Embed the tokenizer so the .wstone is genuinely self-contained: `whetstone
@@ -261,7 +314,7 @@ pub fn run(
 
     // --- report ------------------------------------------------------------
     let out_bytes = std::fs::metadata(out_path)?.len();
-    let src_bytes = std::fs::metadata(&weights)?.len();
+    let src_bytes = st.total_bytes();
     let resident = header.decode_resident_bytes();
     let bw = bandwidth.unwrap_or(278.0);
 
@@ -330,7 +383,7 @@ fn write_fp16<W: std::io::Write + std::io::Seek>(
 }
 
 fn copy_dense<W: std::io::Write + std::io::Seek>(
-    st: &SafeTensors,
+    st: &Checkpoint,
     w: &mut format::Writer<W>,
     name: &str,
 ) -> Result<()> {

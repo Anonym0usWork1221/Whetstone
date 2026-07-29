@@ -157,9 +157,24 @@ enum Command {
         /// Sampling temperature. 0 is greedy and never leaves the GPU.
         #[arg(long, default_value_t = 0.7)]
         temperature: f32,
-        /// Nucleus mass.
+        /// Nucleus mass. 1.0 disables.
         #[arg(long, default_value_t = 0.8)]
         top_p: f32,
+        /// Keep only the k highest-probability tokens. 0 disables.
+        #[arg(long, default_value_t = 20)]
+        top_k: usize,
+        /// Drop candidates below this fraction of the top probability. 0 disables.
+        ///
+        /// Scales with the model's confidence, which top-p does not: one knob
+        /// instead of two, and usually the better default on small models.
+        #[arg(long, default_value_t = 0.0)]
+        min_p: f32,
+        /// Divide the logits of recently emitted tokens by this. 1.0 disables.
+        #[arg(long, default_value_t = 1.05)]
+        repeat_penalty: f32,
+        /// How far back the repetition penalty looks.
+        #[arg(long, default_value_t = 64)]
+        repeat_last_n: usize,
         /// PRNG seed.
         #[arg(long, default_value_t = 0)]
         seed: u64,
@@ -273,6 +288,10 @@ fn main() -> Result<()> {
             max_new,
             temperature,
             top_p,
+            top_k,
+            min_p,
+            repeat_penalty,
+            repeat_last_n,
             seed,
             prompt,
         } => chat::run(chat::ChatArgs {
@@ -283,6 +302,10 @@ fn main() -> Result<()> {
             max_new,
             temperature,
             top_p,
+            top_k,
+            min_p,
+            repeat_penalty,
+            repeat_last_n,
             seed,
             prompt,
         })

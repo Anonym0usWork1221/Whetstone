@@ -11,7 +11,7 @@
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
-use whetstone_core::SafeTensors;
+use whetstone_core::Checkpoint;
 use whetstone_quant::format::{self, TensorKind};
 
 pub fn run(wstone: &Path, source: Option<&Path>, bandwidth: Option<f64>) -> Result<()> {
@@ -83,7 +83,7 @@ pub fn run(wstone: &Path, source: Option<&Path>, bandwidth: Option<f64>) -> Resu
         return Ok(());
     };
 
-    let st = SafeTensors::open(src_dir.join("model.safetensors"))
+    let st = Checkpoint::open(src_dir)
         .with_context(|| format!("could not open source checkpoint in {}", src_dir.display()))?;
 
     println!();

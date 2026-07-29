@@ -79,20 +79,64 @@ struct Activations {
 pub enum Sampler {
     /// Highest logit. Stays entirely on the device.
     Greedy,
-    /// Temperature + nucleus sampling, on the host.
+    /// Stochastic sampling, on the host.
     ///
     /// Costs a 608 KB device-to-host copy of the logits plus an O(vocab)
     /// selection, measured at 369 tok/s against greedy's 467 — about 20%. That
     /// is the price of a distribution the GPU cannot hand back cheaply, and it
     /// is why `--temperature 0` exists.
-    TopP {
-        /// Softmax temperature.
-        temperature: f32,
-        /// Nucleus mass.
-        top_p: f32,
-        /// PRNG seed.
-        seed: u64,
-    },
+    Sample(SamplingConfig),
+}
+
+/// The knobs a stochastic sampler exposes.
+///
+/// Applied in this order, which is the order llama.cpp and the transformers
+/// `LogitsProcessor` stack use, and the order matters: a repetition penalty
+/// applied *after* truncation cannot push a token out of the candidate set,
+/// which is most of what it is for.
+///
+/// 1. repetition penalty over the recent history
+/// 2. temperature
+/// 3. top-k
+/// 4. min-p
+/// 5. top-p (nucleus)
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SamplingConfig {
+    /// Softmax temperature. `<= 0` means greedy.
+    pub temperature: f32,
+    /// Nucleus mass. `>= 1` disables.
+    pub top_p: f32,
+    /// Keep only the `k` highest logits. `0` disables.
+    pub top_k: usize,
+    /// Drop candidates below `min_p * p_max`. `0` disables.
+    ///
+    /// Scales the cut with how confident the model is, which top-p does not: at
+    /// a sharp distribution it keeps almost nothing, at a flat one it keeps a
+    /// lot. That is usually what you want and it is one parameter instead of
+    /// two.
+    pub min_p: f32,
+    /// Divide the logits of recently emitted tokens by this. `1.0` disables.
+    pub repeat_penalty: f32,
+    /// How far back the repetition penalty looks.
+    pub repeat_last_n: usize,
+    /// PRNG seed.
+    pub seed: u64,
+}
+
+impl Default for SamplingConfig {
+    fn default() -> Self {
+        // Qwen's own recommended settings, so the default REPL behaves the way
+        // the model was tuned to.
+        Self {
+            temperature: 0.7,
+            top_p: 0.8,
+            top_k: 20,
+            min_p: 0.0,
+            repeat_penalty: 1.05,
+            repeat_last_n: 64,
+            seed: 0,
+        }
+    }
 }
 
 /// Timing for one generation run.
@@ -160,6 +204,13 @@ pub struct Engine {
     graph: Option<decode::Graph>,
     /// Reused by nucleus sampling so the token loop never allocates.
     sample_order: Vec<u32>,
+    /// Recently seen token ids, for the repetition penalty.
+    ///
+    /// Kept by the engine rather than the caller because it must span the whole
+    /// conversation, not one `generate` call: in a chat REPL the tokens worth
+    /// penalising are mostly from the turn before. Bounded so a long session
+    /// does not grow it without limit.
+    recent: std::collections::VecDeque<u32>,
 }
 
 impl Engine {
@@ -191,7 +242,19 @@ impl Engine {
             caches.push(decode::KvCache::new(n_kv, n_q, hd, max_seq)?);
         }
 
-        let rope = decode::RopeTable::new(max_seq, hd, c.rope_theta as f64)?;
+        // The rotation is identical across every family here; only the frequency
+        // schedule differs, so this is a table parameter and not a kernel variant.
+        let scaling = match &c.rope_scaling {
+            Some(rs) if rs.rope_type == "llama3" => decode::RopeScaling::Llama3 {
+                factor: rs.factor.unwrap_or(8.0),
+                low_freq_factor: rs.low_freq_factor.unwrap_or(1.0),
+                high_freq_factor: rs.high_freq_factor.unwrap_or(4.0),
+                original_max_position: rs.original_max_position_embeddings.unwrap_or(8192),
+            },
+            _ => decode::RopeScaling::None,
+        };
+        let rope =
+            decode::RopeTable::with_scaling(max_seq, hd, c.rope_theta as f64, scaling)?;
 
         Ok(Self {
             weights,
@@ -203,6 +266,7 @@ impl Engine {
             device,
             graph: None,
             sample_order: Vec::new(),
+            recent: std::collections::VecDeque::with_capacity(RECENT_CAP + 1),
         })
     }
 
@@ -289,6 +353,7 @@ impl Engine {
     pub fn reset(&mut self) -> Result<()> {
         self.pos = 0;
         self.acts.pos_dev.set(0)?;
+        self.recent.clear();
         Ok(())
     }
 
@@ -304,7 +369,16 @@ impl Engine {
             )));
         }
         self.acts.token.set(token as i32)?;
+        self.note(token);
         self.step()
+    }
+
+    /// Records a token in the repetition-penalty window.
+    fn note(&mut self, token: u32) {
+        if self.recent.len() == RECENT_CAP {
+            self.recent.pop_front();
+        }
+        self.recent.push_back(token);
     }
 
     /// Runs one step against whatever token id is already on the device.
@@ -447,19 +521,23 @@ impl Engine {
         match sampler {
             // The step already ran the argmax into the device cursor, so greedy
             // is a 4-byte read rather than a reduction.
-            Sampler::Greedy => Ok(self.acts.token.get()? as u32),
-            Sampler::TopP { temperature, top_p, seed } => {
-                let logits = self.logits()?;
-                let t = sample_top_p(
-                    &logits,
-                    temperature,
-                    top_p,
-                    seed,
+            Sampler::Greedy => {
+                let t = self.acts.token.get()? as u32;
+                self.note(t);
+                Ok(t)
+            }
+            Sampler::Sample(cfg) => {
+                let mut logits = self.logits()?;
+                let t = sample_with(
+                    &mut logits,
+                    &cfg,
                     step,
+                    self.recent.iter().copied(),
                     &mut self.sample_order,
                 );
                 // Put the choice where the next step's embedding gather looks.
                 self.acts.token.set(t as i32)?;
+                self.note(t);
                 Ok(t)
             }
         }
@@ -545,27 +623,59 @@ impl Engine {
 /// what every other engine applies anyway (llama.cpp defaults to top-k 40).
 const NUCLEUS_POOL: usize = 512;
 
-/// Temperature + nucleus sampling on the host.
+/// How many recent tokens the repetition penalty can see.
 ///
-/// `order` is caller-owned scratch so the token loop does not allocate 608 KB
-/// per token.
-fn sample_top_p(
-    logits: &[f32],
-    temperature: f32,
-    top_p: f32,
-    seed: u64,
+/// The window a caller asks for is clamped to this. 2048 is far past any useful
+/// `repeat_last_n` — llama.cpp defaults to 64 — and bounds the memory a very
+/// long chat session holds for a feature that only ever looks at the tail.
+const RECENT_CAP: usize = 2048;
+
+/// Stochastic sampling on the host: penalty, temperature, top-k, min-p, top-p.
+///
+/// `logits` is mutated in place — the caller already owns a fresh copy from the
+/// device, and the repetition penalty has to touch the full vector rather than
+/// the truncated pool. Penalising only the survivors of a top-k cut cannot push
+/// a repeated token *out* of the candidate set, which is most of what the
+/// penalty is for.
+///
+/// `order` is caller-owned scratch so the token loop never allocates.
+fn sample_with(
+    logits: &mut [f32],
+    cfg: &SamplingConfig,
     step: u64,
+    recent: impl Iterator<Item = u32>,
     order: &mut Vec<u32>,
 ) -> u32 {
     if logits.is_empty() {
         return 0;
     }
-    if temperature <= 0.0 {
-        return logits
-            .iter()
-            .enumerate()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-            .map_or(0, |(i, _)| i as u32);
+
+    // --- 1. repetition penalty ------------------------------------------
+    //
+    // The CTRL formulation llama.cpp uses: divide a positive logit, multiply a
+    // negative one. Both move it toward zero, which is the point; a plain
+    // subtraction would flip the sign of a strongly negative logit and make a
+    // penalised token *more* likely.
+    if cfg.repeat_penalty != 1.0 && cfg.repeat_last_n > 0 {
+        let window: Vec<u32> = {
+            let all: Vec<u32> = recent.collect();
+            let n = cfg.repeat_last_n.min(all.len());
+            all[all.len() - n..].to_vec()
+        };
+        for &t in &window {
+            let i = t as usize;
+            if i < logits.len() {
+                logits[i] = if logits[i] > 0.0 {
+                    logits[i] / cfg.repeat_penalty
+                } else {
+                    logits[i] * cfg.repeat_penalty
+                };
+            }
+        }
+    }
+
+    if cfg.temperature <= 0.0 {
+        return argmax(logits);
     }
 
     // Descending by logit. `unwrap_or(Equal)` rather than `unwrap`: a NaN logit
@@ -580,46 +690,72 @@ fn sample_top_p(
     order.clear();
     order.extend(0..logits.len() as u32);
 
-    let k = NUCLEUS_POOL.min(order.len());
+    // --- 2. narrow to a pool, then sort only that ------------------------
+    let pool = if cfg.top_k > 0 { cfg.top_k.min(NUCLEUS_POOL) } else { NUCLEUS_POOL };
+    let k = pool.min(order.len());
     if k < order.len() {
         order.select_nth_unstable_by(k - 1, by_logit);
         order.truncate(k);
     }
     order.sort_unstable_by(by_logit);
 
+    // --- 3. temperature --------------------------------------------------
     let max = logits[order[0] as usize] as f64;
     let mut probs: Vec<f64> = Vec::with_capacity(k);
     let mut total = 0f64;
     for &i in order.iter() {
-        let p = (((logits[i as usize] as f64) - max) / temperature as f64).exp();
+        let p = (((logits[i as usize] as f64) - max) / cfg.temperature as f64).exp();
         total += p;
         probs.push(p);
     }
 
-    // Smallest prefix whose mass reaches top_p.
+    // --- 4. min-p ---------------------------------------------------------
+    //
+    // Relative to the top candidate, so the cut tightens automatically when the
+    // model is confident and loosens when it is not. `probs[0]` is the largest
+    // by construction, and the values are unnormalised, so the threshold is a
+    // fraction of it directly.
     let mut cut = probs.len();
-    let mut acc = 0f64;
-    for (i, &p) in probs.iter().enumerate() {
-        acc += p / total;
-        if acc >= top_p as f64 {
-            cut = i + 1;
-            break;
+    if cfg.min_p > 0.0 {
+        let floor = probs[0] * cfg.min_p as f64;
+        cut = probs.iter().position(|&p| p < floor).unwrap_or(probs.len()).max(1);
+    }
+
+    // --- 5. top-p ---------------------------------------------------------
+    if cfg.top_p < 1.0 {
+        let mut acc = 0f64;
+        for (i, &p) in probs.iter().enumerate().take(cut) {
+            acc += p / total;
+            if acc >= cfg.top_p as f64 {
+                cut = i + 1;
+                break;
+            }
         }
     }
 
+    // --- 6. draw ----------------------------------------------------------
     let mass: f64 = probs[..cut].iter().sum();
-    let u = splitmix64(seed ^ step.wrapping_mul(0x9E37_79B9_7F4A_7C15)) as f64
+    let u = splitmix64(cfg.seed ^ step.wrapping_mul(0x9E37_79B9_7F4A_7C15)) as f64
         / u64::MAX as f64
         * mass;
 
     let mut acc = 0f64;
-    for i in 0..cut {
-        acc += probs[i];
+    for (i, &p) in probs.iter().enumerate().take(cut) {
+        acc += p;
         if acc >= u {
             return order[i];
         }
     }
     order[cut.saturating_sub(1)]
+}
+
+/// Index of the largest logit, NaN-tolerant.
+fn argmax(logits: &[f32]) -> u32 {
+    logits
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .map_or(0, |(i, _)| i as u32)
 }
 
 /// SplitMix64. Deterministic, seeded, and one line — a full PRNG dependency for
@@ -653,11 +789,29 @@ mod tests {
         assert_eq!(p90, 60.0);
     }
 
+    /// A config that isolates one knob: nothing else filters.
+    fn plain(temperature: f32, top_p: f32, seed: u64) -> SamplingConfig {
+        SamplingConfig {
+            temperature,
+            top_p,
+            top_k: 0,
+            min_p: 0.0,
+            repeat_penalty: 1.0,
+            repeat_last_n: 0,
+            seed,
+        }
+    }
+
+    fn draw(l: &[f32], cfg: &SamplingConfig, step: u64) -> u32 {
+        let mut v = l.to_vec();
+        sample_with(&mut v, cfg, step, std::iter::empty(), &mut Vec::new())
+    }
+
     #[test]
     fn greedy_is_what_zero_temperature_means() {
         let mut l = vec![0.0f32; 64];
         l[37] = 5.0;
-        assert_eq!(sample_top_p(&l, 0.0, 0.9, 1, 0, &mut Vec::new()), 37);
+        assert_eq!(draw(&l, &plain(0.0, 0.9, 1), 0), 37);
     }
 
     #[test]
@@ -667,16 +821,86 @@ mod tests {
         let mut l = vec![-20.0f32; 512];
         l[100] = 10.0;
         for seed in 0..32u64 {
-            assert_eq!(sample_top_p(&l, 1.0, 0.9, seed, seed, &mut Vec::new()), 100);
+            assert_eq!(draw(&l, &plain(1.0, 0.9, seed), seed), 100);
         }
     }
 
     #[test]
     fn sampling_is_reproducible_for_a_seed() {
         let l: Vec<f32> = (0..1024).map(|i| ((i * 37 % 101) as f32) / 20.0).collect();
-        let mut sc = Vec::new();
-        let a: Vec<u32> = (0..16).map(|s| sample_top_p(&l, 0.8, 0.95, 7, s, &mut sc)).collect();
-        let b: Vec<u32> = (0..16).map(|s| sample_top_p(&l, 0.8, 0.95, 7, s, &mut sc)).collect();
+        let cfg = plain(0.8, 0.95, 7);
+        let a: Vec<u32> = (0..16).map(|s| draw(&l, &cfg, s)).collect();
+        let b: Vec<u32> = (0..16).map(|s| draw(&l, &cfg, s)).collect();
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn top_k_bounds_what_can_be_drawn() {
+        // A flat distribution: without a cut, any of 512 tokens is reachable.
+        // With top-k 3 only the three highest can come out, whatever the seed.
+        let l: Vec<f32> = (0..512).map(|i| i as f32 * 0.01).collect();
+        let cfg = SamplingConfig { top_k: 3, ..plain(2.0, 1.0, 0) };
+        for step in 0..64u64 {
+            let t = draw(&l, &cfg, step);
+            assert!(t >= 509, "top-k 3 produced {t}, which is not in the top three");
+        }
+    }
+
+    #[test]
+    fn min_p_tightens_when_the_model_is_confident() {
+        // The point of min-p over top-p: the cut is relative to the leader, so a
+        // peaked distribution collapses to it and a flat one does not.
+        let mut peaked = vec![0.0f32; 256];
+        peaked[9] = 12.0;
+        let cfg = SamplingConfig { min_p: 0.1, ..plain(1.0, 1.0, 3) };
+        for step in 0..32u64 {
+            assert_eq!(draw(&peaked, &cfg, step), 9);
+        }
+
+        // Flat: min-p must NOT collapse it, or it is just a greedy switch.
+        let flat = vec![1.0f32; 256];
+        let seen: std::collections::HashSet<u32> =
+            (0..64u64).map(|s| draw(&flat, &cfg, s)).collect();
+        assert!(seen.len() > 1, "min-p collapsed a flat distribution to one token");
+    }
+
+    #[test]
+    fn repetition_penalty_moves_logits_toward_zero_from_both_sides() {
+        // The CTRL formulation, and the reason it is a divide rather than a
+        // subtract: a subtraction applied to a negative logit makes a repeated
+        // token MORE likely, which is backwards.
+        let mut l = vec![-8.0f32; 8];
+        l[1] = 6.0; // positive, repeated -> should shrink
+        l[2] = 5.0; // positive, not repeated -> untouched, should now win
+        let cfg = SamplingConfig {
+            repeat_penalty: 2.0,
+            repeat_last_n: 4,
+            ..plain(0.0, 1.0, 0)
+        };
+        let mut v = l.clone();
+        let t = sample_with(&mut v, &cfg, 0, [1u32].into_iter(), &mut Vec::new());
+        assert_eq!(t, 2, "penalised token 1 should have fallen behind token 2");
+        assert!(v[1] < l[1], "positive logit should shrink");
+
+        // A negative logit must move toward zero too, never away.
+        let mut v2 = l.clone();
+        sample_with(&mut v2, &cfg, 0, [0u32].into_iter(), &mut Vec::new());
+        assert!(v2[0] < l[0], "negative logit must be pushed further from zero, \
+                               so the token becomes less likely");
+    }
+
+    #[test]
+    fn repetition_penalty_only_looks_back_repeat_last_n() {
+        let mut l = vec![0.0f32; 8];
+        l[3] = 1.0;
+        let cfg = SamplingConfig {
+            repeat_penalty: 2.0,
+            repeat_last_n: 2,
+            ..plain(0.0, 1.0, 0)
+        };
+        // Token 3 is five back, outside the window, so it must be untouched.
+        let mut v = l.clone();
+        sample_with(&mut v, &cfg, 0, [3u32, 5, 5, 5, 5].into_iter(), &mut Vec::new());
+        assert_eq!(v[3], l[3], "a token outside repeat_last_n was penalised");
     }
 }

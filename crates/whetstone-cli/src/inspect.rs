@@ -3,8 +3,8 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use anyhow::{bail, Context, Result};
-use whetstone_core::{ModelConfig, SafeTensors};
+use anyhow::{Context, Result};
+use whetstone_core::{Checkpoint, ModelConfig};
 use whetstone_kernels::Device;
 
 /// Candidate weight formats and their true cost in bits per weight, including
@@ -25,11 +25,7 @@ pub fn run(model_dir: &Path, bandwidth: Option<f64>, list_tensors: bool) -> Resu
     let cfg = ModelConfig::from_dir(model_dir)
         .with_context(|| format!("could not load config from {}", model_dir.display()))?;
 
-    let weights_path = model_dir.join("model.safetensors");
-    if !weights_path.exists() {
-        bail!("no model.safetensors in {}", model_dir.display());
-    }
-    let st = SafeTensors::open(&weights_path)?;
+    let st = Checkpoint::open(model_dir)?;
 
     // Prefer the real GPU's bandwidth; fall back to a stated value so the tool
     // is still useful on a machine without a CUDA device.

@@ -174,6 +174,92 @@ therefore ships the data-free format; GPTQ is an opt-in offline step.
 - planned Hadamard/rotation preprocessing
 - planned int8 KV cache
 
+## Stage 5c — Architecture coverage  *in progress*
+
+Whetstone executes **one block shape**: pre-norm RMSNorm, RoPE, grouped-query
+attention, SwiGLU. Everything below is measured against whether a family fits
+that shape, because the cost of the ones that do not is not a config change.
+
+**Why this is a whitelist by name and not a structural probe.** A
+mixture-of-experts `config.json` parses *perfectly* as a dense one — it simply
+carries `num_experts` fields `ModelConfig` ignores. A permissive check would
+load it, run it, and generate fluent text produced by one expert's worth of
+weights, with no shape mismatch anywhere to catch it. The same is true of
+QK-norm and of an unimplemented RoPE schedule. **Every architecture failure
+available here is silent**, so the check refuses by family and each new one is a
+deliberate addition.
+
+### Tier 1 — fits the shape  **done**
+
+`qwen2`, `qwen3`\*, `llama`, `mistral`, `smollm2`, and every DeepSeek-R1 distill
+onto those skeletons. They differ only in widths, GQA ratio, whether q/k/v carry
+biases, and the RoPE schedule.
+
+- **done** `ModelConfig::architecture()` — records `qkv_bias` and `qk_norm`
+  instead of hardcoding a family
+- **done** Llama 3.1+ RoPE frequency schedule (`rope_scaling.rope_type = llama3`)
+- **done** Unimplemented RoPE schedules (`yarn`, `dynamic`) refused rather than
+  ignored — ignoring one does not fail, it degrades coherence past the trained
+  context, which reads as the model being bad at long inputs
+- **done** Sharded checkpoints (`model.safetensors.index.json`). Every model
+  above ~2 B ships sharded, so without this the ladder stopped at 1.5 B
+
+\* `qwen3` is refused pending Tier 2.
+
+### Tier 2 — one kernel each  *next, in this order*
+
+| | families | what is needed |
+|---|---|---|
+| planned | **Qwen3**, OLMo2, Gemma2 | **QK-RMSNorm**: an RMSNorm over each head's vector on q and k, after the projection and before RoPE. Two extra weight tensors per layer, one kernel that the existing `rmsnorm` is most of. This is the cheapest way to roughly double model coverage and it should be done first. |
+| planned | GLM-4 (dense), Phi-3 | **Partial rotary** — only `rotary_pct · head_dim` of each head is rotated. A bound on the existing RoPE kernel's loop, plus config plumbing. |
+| planned | Gemma2 | Logit softcapping, sliding-window attention on alternate layers. |
+| planned | Phi-3, some Llama forks | Fused `qkv_proj` in the checkpoint — a load-time split, since Whetstone fuses q/k/v itself and would otherwise fuse an already-fused tensor. |
+
+Each is hours to a day, none touches the GEMV, and none changes the weight
+format.
+
+### Tier 3 — mixture of experts  planned, weeks
+
+Mixtral, Qwen3-MoE, GLM-4.5, DeepSeek-V2/V3, Kimi.
+
+A router GEMV per layer, top-k expert selection, and a **gather over expert
+weights** in the MLP. Worth being precise about the economics, because they are
+unusually favourable here: at batch 1 only the selected experts are read, so a
+sparse model's *bytes per token* is set by its active parameters, not its total.
+An 8×7 B model with 2 active experts reads roughly what a 13 B dense model does.
+That is exactly the regime this engine is built for.
+
+What it costs: a different execution graph. The MLP stops being three fixed
+GEMVs and becomes a data-dependent gather, which means the CUDA graph capture has
+to either be re-captured per routing decision or replaced by a kernel that takes
+the expert indices from device memory — the latter, given that the position
+cursor already works that way.
+
+- planned Router GEMV and top-k selection on device
+- planned Expert-indexed GEMV (the weight pointer becomes a device-side lookup)
+- planned Re-derive the roofline for active-parameter traffic
+- planned Shared-expert handling (DeepSeek, Qwen3-MoE keep one always-on expert)
+
+### Tier 4 — Multi-head Latent Attention  planned, weeks
+
+DeepSeek-V2/V3 and Kimi replace attention with MLA: K and V are compressed into a
+shared low-rank latent that is what the cache actually stores, with per-head
+up-projections applied at use. It is a genuinely different algorithm with a
+different cache layout, not a variation on GQA — the existing `attn_decode`
+kernel and `KvCache` do not generalise to it.
+
+It is also the most interesting thing on this list for a bandwidth-bound engine,
+because MLA exists precisely to shrink the KV cache, and KV traffic is what
+eventually bounds long-context decode once the weights are 4 bits.
+
+### What will not run here regardless
+
+Kimi K2 is ~1 T parameters and DeepSeek-V3 is 671 B. At 4.28 bits that is 535 GB
+and 359 GB of weights against 6 GB of VRAM. No quantizer closes a 60–90× gap;
+those need a different machine, not a different kernel. Their runnable members on
+this card are the distills — `DeepSeek-R1-Distill-Qwen-1.5B`,
+`-Llama-8B` — and both are Tier 1, so both work today.
+
 ## Stage 6 — Speculative decoding  planned
 
 Lossless: the output distribution is provably identical. It also converts the

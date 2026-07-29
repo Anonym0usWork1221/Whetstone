@@ -38,7 +38,9 @@ use std::path::Path;
 use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
-use whetstone_core::{Engine, ModelWeights, Sampler, StreamDecoder, Tokenizer};
+use whetstone_core::{
+    Engine, ModelWeights, Sampler, SamplingConfig, StreamDecoder, Tokenizer,
+};
 
 /// Whether to emit ANSI styling.
 ///
@@ -76,9 +78,48 @@ pub struct ChatArgs<'a> {
     pub max_new: usize,
     pub temperature: f32,
     pub top_p: f32,
+    pub top_k: usize,
+    pub min_p: f32,
+    pub repeat_penalty: f32,
+    pub repeat_last_n: usize,
     pub seed: u64,
     /// Answer this and exit, instead of reading from the terminal.
     pub prompt: Option<String>,
+}
+
+impl ChatArgs<'_> {
+    fn sampling(&self) -> SamplingConfig {
+        SamplingConfig {
+            temperature: self.temperature,
+            top_p: self.top_p,
+            top_k: self.top_k,
+            min_p: self.min_p,
+            repeat_penalty: self.repeat_penalty,
+            repeat_last_n: self.repeat_last_n,
+            seed: self.seed,
+        }
+    }
+}
+
+/// One line describing what the sampler will do.
+fn describe(cfg: &SamplingConfig) -> String {
+    if cfg.temperature <= 0.0 {
+        return "greedy (stays on the device)".into();
+    }
+    let mut parts = vec![format!("temp {:.2}", cfg.temperature)];
+    if cfg.top_k > 0 {
+        parts.push(format!("top-k {}", cfg.top_k));
+    }
+    if cfg.top_p < 1.0 {
+        parts.push(format!("top-p {:.2}", cfg.top_p));
+    }
+    if cfg.min_p > 0.0 {
+        parts.push(format!("min-p {:.2}", cfg.min_p));
+    }
+    if cfg.repeat_penalty != 1.0 {
+        parts.push(format!("repeat {:.2}/{}", cfg.repeat_penalty, cfg.repeat_last_n));
+    }
+    format!("{} (costs a logit copy per token)", parts.join(", "))
 }
 
 pub fn run(args: ChatArgs<'_>) -> Result<()> {
@@ -127,26 +168,29 @@ pub fn run(args: ChatArgs<'_>) -> Result<()> {
         "  roofline           {:.0} tok/s at {peak:.0} GB/s peak",
         peak * 1e9 / decode_bytes as f64
     );
-    println!("  context            {} tokens", args.ctx);
-    println!("  cuda graph         {launches} launches per token collapsed into 1");
+    let kv = engine.weights().config.kv_cache_bytes(args.ctx, 2);
     println!(
-        "  sampling           {}",
-        if args.temperature <= 0.0 {
-            "greedy (stays on the device)".to_string()
-        } else {
-            format!(
-                "temperature {:.2}, top-p {:.2} (costs a logit copy per token)",
-                args.temperature, args.top_p
-            )
-        }
+        "  context            {} tokens  (KV cache {:.0} MB)",
+        args.ctx,
+        kv as f64 / 1e6
     );
+    println!(
+        "  vram               {:.0} MB weights + {:.0} MB cache of {:.1} GB",
+        decode_bytes as f64 / 1e6,
+        kv as f64 / 1e6,
+        engine.device().mem_total() as f64 / 1e9
+    );
+    println!("  cuda graph         {launches} launches per token collapsed into 1");
+    println!("  sampling           {}", describe(&args.sampling()));
     println!("  loaded in          {load_s:.2} s");
     println!("{:-<72}", "");
 
-    let sampler = if args.temperature <= 0.0 {
-        Sampler::Greedy
-    } else {
-        Sampler::TopP { temperature: args.temperature, top_p: args.top_p, seed: args.seed }
+    // Mutable, because `/set` changes it between turns. Kept as a config rather
+    // than a `Sampler` so `/set temperature 0` can switch to the greedy path,
+    // which is a different code path and 20% faster.
+    let mut cfg = args.sampling();
+    let sampler_of = |c: &SamplingConfig| {
+        if c.temperature <= 0.0 { Sampler::Greedy } else { Sampler::Sample(*c) }
     };
 
     let ansi = use_ansi();
@@ -157,16 +201,17 @@ pub fn run(args: ChatArgs<'_>) -> Result<()> {
     // One-shot mode: answer and exit, so the command is scriptable.
     if let Some(p) = &args.prompt {
         let prompt = segment(&system, p, true);
-        answer(&mut engine, &tokenizer, &prompt, sampler, args.max_new, im_end, eos,
+        answer(&mut engine, &tokenizer, &prompt, sampler_of(&cfg), args.max_new, im_end, eos,
                decode_bytes, ansi, &mut turn, &mut totals)?;
         return Ok(());
     }
 
-    println!("  Type a message. /reset clears the conversation, /quit exits.");
+    println!("  Type a message. /help lists the commands, /quit exits.");
     println!();
 
     let stdin = std::io::stdin();
     let mut lines = stdin.lock().lines();
+    let mut system = system;
 
     loop {
         print!("{}", if ansi { "\x1b[1m> \x1b[0m" } else { "> " });
@@ -176,13 +221,46 @@ pub fn run(args: ChatArgs<'_>) -> Result<()> {
         let line = line?;
         let msg = line.trim();
 
-        match msg {
+        let (cmd, rest) = match msg.split_once(char::is_whitespace) {
+            Some((c, r)) => (c, r.trim()),
+            None => (msg, ""),
+        };
+
+        match cmd {
             "" => continue,
             "/quit" | "/exit" | "/q" => break,
+            "/help" | "/?" => {
+                print_help();
+                continue;
+            }
             "/reset" => {
                 engine.reset()?;
                 turn = 0;
                 println!("  (conversation cleared, KV cache dropped)\n");
+                continue;
+            }
+            "/system" => {
+                if rest.is_empty() {
+                    println!("  system: {system}\n");
+                } else {
+                    system = rest.to_string();
+                    engine.reset()?;
+                    turn = 0;
+                    println!("  (system prompt set; the cache held the old one, so it \
+                              was dropped)\n");
+                }
+                continue;
+            }
+            "/params" => {
+                println!("  {}\n  ctx {} of {}, max-new {}\n",
+                         describe(&cfg), engine.position(), args.ctx, args.max_new);
+                continue;
+            }
+            "/set" => {
+                match set_param(&mut cfg, rest) {
+                    Ok(()) => println!("  {}\n", describe(&cfg)),
+                    Err(e) => println!("  {e}\n"),
+                }
                 continue;
             }
             "/stats" => {
@@ -204,7 +282,7 @@ pub fn run(args: ChatArgs<'_>) -> Result<()> {
         // Only the new turn goes in; everything before it is already in the KV
         // cache. The system prompt therefore appears exactly once.
         let prompt = segment(&system, msg, turn == 0);
-        if let Err(e) = answer(&mut engine, &tokenizer, &prompt, sampler, args.max_new,
+        if let Err(e) = answer(&mut engine, &tokenizer, &prompt, sampler_of(&cfg), args.max_new,
                                im_end, eos, decode_bytes, ansi, &mut turn, &mut totals) {
             println!("\n  error: {e}\n");
             if format!("{e}").contains("context is full") {
@@ -310,5 +388,75 @@ fn answer(
     }
     println!();
     println!();
+    Ok(())
+}
+
+/// The REPL's commands, listed where someone will actually look for them.
+fn print_help() {
+    println!(
+        "  /help                 this list
+  /params               current sampling settings and context use
+  /set <name> <value>   change one setting for the next turn
+  /system [text]        show, or replace, the system prompt (clears the cache)
+  /reset                clear the conversation and drop the KV cache
+  /stats                throughput across the session
+  /quit                 exit
+
+  settable: temperature, top-p, top-k, min-p, repeat-penalty, repeat-last-n, seed
+  temperature 0 switches to the greedy path, which is about 20% faster
+  because it never copies the logits back to the host.
+"
+    );
+}
+
+/// Applies one `/set name value` pair.
+///
+/// Values are range-checked here rather than left to the sampler, because a
+/// silently-clamped setting in an interactive session is worse than an error:
+/// the user sees the output change and attributes it to the wrong knob.
+fn set_param(cfg: &mut SamplingConfig, rest: &str) -> std::result::Result<(), String> {
+    let mut it = rest.split_whitespace();
+    let (Some(name), Some(value)) = (it.next(), it.next()) else {
+        return Err("usage: /set <name> <value>   (/help lists the names)".into());
+    };
+
+    fn num<T: std::str::FromStr>(v: &str, name: &str) -> std::result::Result<T, String> {
+        v.parse::<T>().map_err(|_| format!("{name}: {v:?} is not a number"))
+    }
+
+    match name {
+        "temperature" | "temp" => {
+            let v: f32 = num(value, name)?;
+            if !(0.0..=5.0).contains(&v) {
+                return Err(format!("temperature {v} is outside 0..=5"));
+            }
+            cfg.temperature = v;
+        }
+        "top-p" | "top_p" => {
+            let v: f32 = num(value, name)?;
+            if !(0.0..=1.0).contains(&v) {
+                return Err(format!("top-p {v} is outside 0..=1"));
+            }
+            cfg.top_p = v;
+        }
+        "top-k" | "top_k" => cfg.top_k = num(value, name)?,
+        "min-p" | "min_p" => {
+            let v: f32 = num(value, name)?;
+            if !(0.0..=1.0).contains(&v) {
+                return Err(format!("min-p {v} is outside 0..=1"));
+            }
+            cfg.min_p = v;
+        }
+        "repeat-penalty" | "repeat_penalty" => {
+            let v: f32 = num(value, name)?;
+            if !(0.5..=2.0).contains(&v) {
+                return Err(format!("repeat-penalty {v} is outside 0.5..=2"));
+            }
+            cfg.repeat_penalty = v;
+        }
+        "repeat-last-n" | "repeat_last_n" => cfg.repeat_last_n = num(value, name)?,
+        "seed" => cfg.seed = num(value, name)?,
+        _ => return Err(format!("unknown setting {name:?}; /help lists them")),
+    }
     Ok(())
 }

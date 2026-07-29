@@ -136,7 +136,12 @@ pub fn run(args: RunArgs<'_>) -> Result<()> {
     let sampler = if args.temperature <= 0.0 {
         Sampler::Greedy
     } else {
-        Sampler::TopP { temperature: args.temperature, top_p: args.top_p, seed: args.seed }
+        Sampler::Sample(whetstone_core::SamplingConfig {
+            temperature: args.temperature,
+            top_p: args.top_p,
+            seed: args.seed,
+            ..Default::default()
+        })
     };
 
     let mut out_ids: Vec<u32> = Vec::with_capacity(args.max_new);

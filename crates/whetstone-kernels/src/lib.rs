@@ -23,7 +23,7 @@ pub mod gemv;
 
 pub use decode::{
     argmax, attn_decode, embed_fp16, embed_int4, nll, rmsnorm, rope_cache, stream_sync, swiglu,
-    DeviceCursor, Event, Graph, KvCache, RopeTable,
+    DeviceCursor, Event, Graph, KvCache, RopeScaling, RopeTable,
 };
 pub use ffi::{DeviceInfo, ProbeResult};
 pub use gemv::{bench_gemv, gemv_fp16, gemv_fp16_ex, variant, GemvBench, QuantLinear, GROUP};
@@ -153,6 +153,20 @@ impl Device {
     /// `tok/s <= bandwidth / bytes_read_per_token`.
     pub fn bandwidth_gbs(&self) -> f64 {
         self.info.bandwidth_gbs
+    }
+
+    /// Total device memory in bytes.
+    pub fn mem_total(&self) -> u64 {
+        self.info.mem_total
+    }
+
+    /// Free device memory in bytes, as reported when the device was opened.
+    ///
+    /// Worth showing next to the model size on a 6 GB card: weights plus KV
+    /// cache is the whole budget, and the failure mode when it does not fit is
+    /// an allocation error a long way from the flag that caused it.
+    pub fn mem_free(&self) -> u64 {
+        self.info.mem_free
     }
 
     /// Blocks until all previously issued work completes.

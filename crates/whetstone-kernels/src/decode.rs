@@ -56,9 +56,48 @@ pub struct RopeTable {
     pub half_dim: usize,
 }
 
+/// How the inverse frequencies are stretched for long context.
+///
+/// The rotation itself is identical across every architecture Whetstone
+/// supports; only the frequency schedule differs, which is why this is a table
+/// parameter rather than a kernel variant.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RopeScaling {
+    /// No stretching. Qwen2/2.5, Mistral, Llama 2.
+    None,
+    /// Llama 3.1+ piecewise schedule.
+    ///
+    /// Wavelengths shorter than the original context are left alone, those
+    /// longer than it are divided by `factor`, and the band between is blended.
+    /// Getting this wrong does not crash — it degrades coherence past the
+    /// original context length, which reads as the model being bad at long
+    /// inputs rather than as a bug.
+    Llama3 {
+        /// Context multiplier.
+        factor: f64,
+        /// Wavelength below which frequencies are untouched, as a divisor of
+        /// the original context.
+        low_freq_factor: f64,
+        /// Wavelength above which frequencies are fully divided.
+        high_freq_factor: f64,
+        /// The context length the model was trained at.
+        original_max_position: usize,
+    },
+}
+
 impl RopeTable {
-    /// Builds the table for `max_seq` positions.
+    /// Builds the table for `max_seq` positions with no frequency scaling.
     pub fn new(max_seq: usize, head_dim: usize, theta: f64) -> Result<Self> {
+        Self::with_scaling(max_seq, head_dim, theta, RopeScaling::None)
+    }
+
+    /// Builds the table for `max_seq` positions.
+    pub fn with_scaling(
+        max_seq: usize,
+        head_dim: usize,
+        theta: f64,
+        scaling: RopeScaling,
+    ) -> Result<Self> {
         if head_dim % 2 != 0 || head_dim == 0 {
             return Err(Error::Shape(format!("rope: head_dim {head_dim} must be even")));
         }
@@ -66,8 +105,29 @@ impl RopeTable {
         let mut cos = vec![0f32; max_seq * half];
         let mut sin = vec![0f32; max_seq * half];
 
-        for (j, (invf,)) in (0..half).map(|j| (theta.powf(-(j as f64) / half as f64),)).enumerate()
-        {
+        for j in 0..half {
+            let mut invf = theta.powf(-(j as f64) / half as f64);
+            if let RopeScaling::Llama3 {
+                factor,
+                low_freq_factor,
+                high_freq_factor,
+                original_max_position,
+            } = scaling
+            {
+                let orig = original_max_position as f64;
+                let low_wl = orig / low_freq_factor;
+                let high_wl = orig / high_freq_factor;
+                let wavelen = 2.0 * std::f64::consts::PI / invf;
+                if wavelen > low_wl {
+                    // Longer than the low-frequency wavelength: divide fully.
+                    invf /= factor;
+                } else if wavelen > high_wl {
+                    // The blend band. `smooth` runs 1 -> 0 across it.
+                    let smooth = (orig / wavelen - low_freq_factor)
+                        / (high_freq_factor - low_freq_factor);
+                    invf = (1.0 - smooth) * (invf / factor) + smooth * invf;
+                }
+            }
             for p in 0..max_seq {
                 // f64 throughout: the angle reaches ~3e4 radians at long
                 // context, where an f32 argument has already lost the low bits

@@ -10,7 +10,72 @@ Versioning is [semantic](https://semver.org/), with one project-specific rule:
 
 ## [Unreleased]
 
-Nothing yet.
+### Added
+
+- **Sampling controls in `whetstone chat` and a live `/set`.** `--top-k`,
+  `--min-p`, `--repeat-penalty` and `--repeat-last-n` join the existing
+  `--temperature` / `--top-p` / `--seed`, and `/set <name> <value>` changes any of
+  them between turns without reloading the model. `/help`, `/params` and
+  `/system` round out the REPL.
+
+  Filters apply in the order penalty → temperature → top-k → min-p → top-p, and
+  the repetition penalty runs against the **full** logit vector rather than the
+  truncated candidate pool — penalising only the survivors of a top-k cut cannot
+  push a repeated token out of the set, which is most of what it is for. The
+  penalty is a divide rather than a subtract (the CTRL formulation), because a
+  subtraction moves a negative logit *away* from zero and makes a repeated token
+  more likely.
+
+  The repetition window lives in the `Engine` rather than the caller, so it spans
+  a conversation instead of one `generate` call.
+
+- The chat banner reports the VRAM split — weights, KV cache, and the card's
+  total. On a 6 GB card running a multi-billion-parameter model that is the
+  budget, and the failure mode without it is an allocation error a long way from
+  the flag that caused it.
+
+- **Sharded checkpoints.** Every HuggingFace model above roughly 2 B parameters
+  ships as `model-0000N-of-0000M.safetensors` plus a
+  `model.safetensors.index.json` weight map; `convert`, `inspect` and `verify`
+  opened only a single `model.safetensors` and bailed otherwise. That excluded
+  every model large enough for the engine's bandwidth argument to be
+  interesting. The new `Checkpoint` type mmaps each shard and routes lookups by
+  name, so a 15 GB checkpoint still touches only the pages of the tensor being
+  quantized, and it cross-checks the index against the shards at open time
+  rather than letting a stale index surface as a missing-tensor error midway
+  through a conversion.
+
+- **Model families beyond Qwen.** `ModelConfig::architecture()` replaces a
+  `qwen2`/`qwen3` `model_type` whitelist that had fallen behind what the kernels
+  could already execute. Llama 2/3.x, Mistral, SmolLM2 and every DeepSeek-R1
+  distill onto those skeletons run the identical block — pre-norm RMSNorm, RoPE,
+  GQA, SwiGLU — and differ only in widths, GQA ratio, whether q/k/v carry biases,
+  and the RoPE schedule. The Llama 3.1+ RoPE frequency schedule is implemented;
+  unimplemented ones (`yarn`, `dynamic`) are refused rather than ignored, because
+  ignoring one does not fail — it degrades coherence past the trained context.
+
+  The check remains a whitelist by family name rather than a structural probe. A
+  mixture-of-experts `config.json` parses perfectly as a dense one, so a
+  permissive check would load it, run it, and generate fluent text produced by
+  one expert's worth of weights, with no shape mismatch anywhere to catch it.
+  [docs/ROADMAP.md](docs/ROADMAP.md) Stage 5c has the ordered plan for the
+  families that do not fit.
+
+### Fixed
+
+- **`--head` now applies to the untied `lm_head`.** Previously it quantized
+  `model.embed_tokens.weight` and copied `lm_head.weight` as dense fp16. On a
+  tied model those are the same tensor, so it was invisible; on an untied one it
+  is exactly inverted, because the input embedding is a single-row gather that
+  costs no bandwidth while the output projection is a full GEMV every token. On
+  Qwen2.5-7B that was a 1.09 GB fp16 matrix where 291 MB was intended.
+
+- **`convert` refuses checkpoints with per-head `q_norm`/`k_norm`.** `ModelConfig`
+  accepts `model_type == "qwen3"` because the layer topology matches, but Qwen3
+  applies RMSNorm to the query and key head vectors before RoPE and Whetstone's
+  attention does not implement it. Such a model converted, loaded, ran, and
+  generated fluent text that was quantitatively wrong — the worst failure mode
+  available. It is now detected from the tensor names and refused.
 
 ---
 
