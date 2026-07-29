@@ -10,6 +10,152 @@ Versioning is [semantic](https://semver.org/), with one project-specific rule:
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-07-30
+
+**Conversion got 7× faster, one archive now runs on every NVIDIA GPU since
+Pascal, and a quantizer bug that had been present since the format was written
+was found by the first model large enough to trigger it.**
+
+### Added
+
+- **`convert --head-rescore`: exact recomputation of the logits that decide the
+  token.** The output projection is one matrix read in full every token, so
+  quantizing it is the largest bandwidth win available and the change that most
+  perturbs the output distribution. This stores an fp16 copy alongside the
+  quantized head and recomputes only the leaders at decode time.
+
+  Measured on Qwen2.5-0.5B, wikitext-2, 20×2048 windows (fp16 model = 13.8182):
+
+  | body + head | perplexity | decode | bytes/token |
+  |---|---|---|---|
+  | int4-hier + **fp16 head** | 15.3711 | 254.8 tok/s | 464 MB |
+  | int4-hier + int4 head | 16.0220 | 404.2 tok/s | 264 MB |
+  | int4-hier + int4 head **+ rescore** | **15.4717** | ~4.5% below | 264 MB |
+
+  **It recovers 85% of the gap to an fp16 head at int4-head bandwidth.** The cost
+  is VRAM — 272 MB on the 0.5B — which is the resource that is not binding, plus
+  ~4.5% of the decode step (median of five interleaved pairs; the machine was not
+  idle, so treat the absolute tok/s as depressed and the ratio as sound).
+
+  Three implementation notes, each of which was a measurement rather than a
+  choice:
+
+  - **No top-k kernel.** A radix select over 151,936 logits is days of work for a
+    0.1 perplexity item. A *threshold* selects the same set and is two
+    reductions; it is picked on device from a geometric ladder (1/64 to 32 nats)
+    by counting what each candidate admits, because logit spreads vary per token.
+  - **Grid-wide, not one block.** The first version reduced in a single block and
+    cost **7.7%** of the decode step against a bandwidth model predicting 0.17% —
+    one SM of thirty reading 608 KB. Splitting both O(vocab) passes across the
+    grid brought it to ~1% at the original cap.
+  - **Every survivor is rescored, and the threshold never overflows the buffer.**
+    The first version kept one block per row and dropped anything past the cap,
+    so `atomicAdd` scheduling decided *which* rows survived and perplexity varied
+    run to run (17.3402 / 17.3400 / 17.3345 on identical input). Rescoring the
+    whole selected set makes the compaction's order invisible, and the threshold
+    search now steps to a tighter rung rather than exceed the buffer — fewer rows
+    deterministically beats more rows arbitrarily. Verified: three identical runs
+    now give 17.1002 exactly.
+
+  Every launch is a fixed shape with its data-dependent count read from device
+  memory, so the whole rescore stays inside the captured decode graph. The fp16
+  copy is excluded from `decode_resident_bytes` by a name suffix, because it is
+  resident but not streamed — counting it would invert the trade the feature
+  exists to make.
+
+- **QK-RMSNorm**, folded into both RoPE kernels rather than given its own launch.
+  Qwen3, Qwen3-MoE, OLMo2 and Gemma2 normalise each *head's* q and k vector
+  before the rotation; the rotation already holds that vector in registers two
+  elements per lane, so the norm costs one block reduction and **no extra pass
+  over memory**. `convert` and `ModelConfig` no longer refuse these families.
+  Half a gain pair is now an error at load rather than a silent skip.
+- **Fat CUDA binary: one archive for `sm_60` through `sm_90`, plus a PTX tail**
+  so the driver JITs onto anything newer. Verified with `cuobjdump`. Device code
+  gates on `__CUDA_ARCH__` (redefined per compilation pass) and host code queries
+  the driver at run time — a build-time `-D` can answer neither question in a fat
+  binary. `WHETSTONE_CUDA_ARCH=native` for fast iteration, `=all` (the default)
+  for release. 82 s to build all eight images.
+- **Runtime CPU dispatch** (`whetstone-quant::cpu`): the row packers and the
+  `f16` converters are compiled at baseline / SSE4.1 / AVX2+FMA+F16C and selected
+  from `is_x86_feature_detected!`, so the binary still runs on a 2003 CPU while
+  using AVX2 where it exists.
+- **Mixture-of-experts routing kernels** (`wst_moe_router`,
+  `wst_moe_accumulate`): softmax over all experts then top-k — HuggingFace's
+  order, not the obvious one — with deterministic tie-breaking, results left in
+  device memory so a MoE step stays capturable as one CUDA graph.
+  Differential-tested at the OLMoE (64-of-8), Qwen3-30B-A3B (128-of-8) and
+  Mixtral (8-of-2) geometries. No MoE checkpoint executes yet.
+- `--jobs/-j` to size the worker pool.
+
+### Changed
+
+- **`convert` is 7.0× faster and its output is byte-identical.** Qwen2.5-0.5B,
+  twelve threads: **83.4 s → 12.0 s**. Rows are packed in parallel (`rayon`), the
+  loader runs one tensor ahead of the packer across a rendezvous channel, the
+  weight-error metric is accumulated *during* packing instead of by
+  reconstructing every tensor afterwards, and `to_f32` widens in parallel.
+  Qwen2.5-7B (15.2 GB, 4 shards) converts in **230 s warm / 418 s cold**, at
+  which point it is disk-bound rather than CPU-bound.
+- Threading alone was 4.9× of that. The other 1.67× was the **instruction set**:
+  Rust's default `x86-64` target is SSE2, which has no `roundps`, so every
+  `.round()` in the k-quant fit was a `roundf` **libm call** — 7.4 billion of
+  them per 0.5 B conversion.
+
+### Fixed
+
+- **The hierarchical format's shared fp16 row scale could underflow to zero.**
+  `d = max_scale/15`, and f16's smallest subnormal is 5.96e-8, so any row
+  spanning less than ~1.3e-5 packed as garbage: `s = d·ls` is zero and
+  `q = (w−m)/s` is an infinity. Present since the format was written and
+  invisible at 0.5 B, 1.5 B and 3 B; **Qwen2.5-7B found it.** The scale is now
+  clamped into `[5.96e-8, 65504]`.
+- `convert` **aborts and names the tensor** on a non-finite weight error instead
+  of summing it into a mean that reads `NaN` after seven minutes.
+
+- **`probe` could fabricate a throughput number on a fat binary.** The host
+  capability macros (`WST_HOST_HAS_*`) describe the *installed device*; the
+  device gates (`WST_DEV_HAS_*`) describe the *loaded image*. They agree only
+  when the archive holds an exact image for the running card. When it does not —
+  an sm_72 card on the sm_70 image, or any card running a
+  `WHETSTONE_CUDA_ARCH=70` build — the host launched a kernel whose body had been
+  `#if`-ed away, got a clean `cudaGetLastError()`, and divided real work-units by
+  pure launch overhead. The image now reports its own capabilities
+  (`probe_image_caps`) and a path counts as available only when the device *and*
+  the image have it. Verified: an sm_70 build on this sm_75 card now prints
+  `unsupported` for int8/int4/bmma where it previously printed numbers.
+- **`--version` misreported which architectures the binary carries.** It printed
+  the `WHETSTONE_CUDA_ARCH` *request* — `sm_all`, `sm_native`, or a default
+  `sm_75` for an eight-image archive. It now prints the resolved list from
+  `whetstone_kernels::CUDA_ARCH_LIST`, which is the only crate whose build script
+  knows it.
+- **The `--head fp16` advisory quoted a parameter fraction as a byte fraction.**
+  On the default invocation it said `lm_head is 28% of the bytes above` where the
+  true share was 59% — understating the project's largest bandwidth decision by
+  2.1×, in the one place the tool advises on it. Now read from the header that
+  was just written.
+- `WHETSTONE_CUDA_ARCH=all` **no longer degrades silently to a single
+  architecture** when `nvcc --list-gpu-arch` cannot be read; it fails loudly.
+  `=native` on a GPU newer than the toolkit now clamps to the newest buildable
+  image plus the PTX tail with a warning, instead of asserting about a request
+  the user did not make.
+- `probe` no longer divides by the `-1` unavailability sentinel on cards without
+  fp16 tensor cores (sm_60/sm_61, both in the shipped set), which printed
+  negative ratios beside real measurements. The matching test no longer requires
+  tensor cores to exist.
+- Sub-byte (`s4`) and single-bit (`b1`) WMMA are gated to `sm_75..sm_99`. They
+  are a Turing-through-Hopper family and are not in the Blackwell ISA, so the
+  open-ended `>= 750` gate would have failed the sm_100/sm_120 passes of an `all`
+  build on CUDA 12.8+. Unverified locally — this toolkit tops out at compute_90.
+
+### Measured
+
+| | |
+|---|---|
+| Qwen2.5-7B, int4-hier body + head | **47.2 tok/s**, 178 GB/s achieved (64% of the measured 278) |
+| — wikitext-2 perplexity | **7.6659** at 4.257 bits/weight |
+| — mean relative weight error | 0.0867 (0.0855–0.0861 at 0.5/1.5/3 B) |
+| Roofline prediction for that model, made before converting it | 47 tok/s |
+
 ## [0.5.0] — 2026-07-29
 
 **One pass over the weights, many tokens.** Every weight had been read once per

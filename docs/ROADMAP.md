@@ -155,11 +155,20 @@ therefore ships the data-free format; GPTQ is an opt-in offline step.
 
 ## Stage 5b — What is left in the quantizer  *next*
 
-- planned **fp16 top-k re-score under a quantized head.** Measured in the
-  research harness: k=64 removes **82%** of the head's remaining cost for
-  `64·896·2` = 114 KB/token — **0.17% more bandwidth** — plus 272 MB of VRAM,
-  which a 6 GB card holding a 264 MB model is not short of. Needs a top-k
-  reduction and a gathered 64×896 GEMV; neither touches the main decode path.
+- **done (0.6.0)** **fp16 top-k re-score under a quantized head**
+  (`convert --head-rescore`). End to end on Qwen2.5-0.5B: **16.0220 → 15.4717**
+  perplexity, against 15.3711 for a full fp16 head — **85% of the gap, at
+  int4-head bandwidth**, for 272 MB of VRAM and ~4.5% of the decode step.
+
+  It needed no top-k kernel. A *threshold* selects the same set for two
+  reductions, chosen on device from a geometric ladder because logit spreads vary
+  per token. Two things went wrong and are worth keeping: reducing in a **single
+  block** cost 7.7% where the bandwidth model said 0.17% (one SM of thirty
+  reading 608 KB — the model was right about bytes and silent about
+  parallelism), and dropping rows past a buffer cap made the result depend on
+  `atomicAdd` scheduling, so perplexity moved run to run. Fixed by rescoring
+  every survivor and never letting the threshold overflow the buffer: **fewer
+  rows deterministically beats more rows arbitrarily.**
 - planned Sensitivity-aware bit allocation. `v_proj` is the worst tensor in
   every one of the 24 layers and is 0.93% of parameters; llama.cpp bumps exactly
   this tensor and gates the rule on `n_gqa >= 4`, and this model is 7.
@@ -168,9 +177,31 @@ therefore ships the data-free format; GPTQ is an opt-in offline step.
 - planned Calibration on a broad corpus (C4) rather than in-domain wikitext,
   which is what the literature does and what the domain-shift result above says
   is the honest configuration.
-- planned int3 with hierarchical scales **and** GPTQ. int3-g128 round-to-nearest
-  measured +29 and was written off; the two techniques are jointly worth 2.06 at
-  4 bits and int3 has never been measured with them.
+- **killed** int3 with hierarchical scales. Hierarchical metadata does help —
+  +29 (g128 RTN) becomes **+10.215** at 0.5 B — but nowhere near enough, and
+  GPTQ's −0.907 does not close a ten-point gap. The ladder then killed it
+  outright: **+10.215 at 0.5 B, +3.988 at 1.5 B, +5.688 at 3 B.** int4 improves
+  monotonically with model size; **int3 does not.** An earlier note read the
+  first two rungs, called it a trend, and estimated ~+1.5 at 7 B — the next rung
+  falsified that. Two points looked like a line. int2-hier is +3 861.
+- **killed** vector quantization below 4 bits, and the bound that explains it.
+  A learned codebook at `d=2, b=8` does beat the shipped scalar format
+  (+1.412 at 4.14 bpw against +1.575 at 4.277) — but Δ perplexity turns out to be
+  a function of *effective levels per dimension*, `2^(b/d)`, and essentially not
+  of `d`: 16 levels is fine at any `d`, 5.7 is +22.9, 4 is +562, 2 is +640 246.
+  **Vectorising redistributes quality within a bit budget; it does not create
+  one.** AQLM's 2-bit headline comes from *additive* quantization with many
+  summed codebooks plus fine-tuning, not from vectorising — a single 256-entry
+  codebook was never going to reach it.
+- **killed** low-rank weight factorisation. The best possible rank-r
+  approximation (truncated SVD, so no fitting error to blame) at half the
+  parameters is **+184 294 perplexity at an effective 8 bits/weight**, while
+  int4-hier reads *half* those bytes for +1.575. Transformer weight matrices are
+  near full rank, and the arithmetic leaves almost no room anyway: a
+  factorisation only saves when `r < out·in/(out+in)`, which for 4864×896 is
+  1.18× of headroom before it costs more than it saves.
+
+  **Four bits is this engine's floor**, and the three kills above are why.
 - planned Hadamard/rotation preprocessing
 - planned int8 KV cache
 
@@ -210,7 +241,7 @@ biases, and the RoPE schedule.
 
 | | families | what is needed |
 |---|---|---|
-| planned | **Qwen3**, OLMo2, Gemma2 | **QK-RMSNorm**: an RMSNorm over each head's vector on q and k, after the projection and before RoPE. Two extra weight tensors per layer, one kernel that the existing `rmsnorm` is most of. This is the cheapest way to roughly double model coverage and it should be done first. |
+| **done (0.6.0)** | **Qwen3**, OLMo2, Gemma2 | **QK-RMSNorm** — folded into both RoPE kernels rather than given its own launch: the rotation already holds each head's vector in registers two elements per lane, which is exactly the layout a per-head RMS reduction wants, so it costs one block reduction and no extra pass over memory. Differential-tested against an f64 CPU reference with distinct q and k gains. **Not yet run on a real Qwen3 checkpoint** — the kernel is verified, the family is not. |
 | planned | GLM-4 (dense), Phi-3 | **Partial rotary** — only `rotary_pct · head_dim` of each head is rotated. A bound on the existing RoPE kernel's loop, plus config plumbing. |
 | planned | Gemma2 | Logit softcapping, sliding-window attention on alternate layers. |
 | planned | Phi-3, some Llama forks | Fused `qkv_proj` in the checkpoint — a load-time split, since Whetstone fuses q/k/v itself and would otherwise fuse an already-fused tensor. |
@@ -218,7 +249,43 @@ biases, and the RoPE schedule.
 Each is hours to a day, none touches the GEMV, and none changes the weight
 format.
 
-### Tier 3 — mixture of experts  planned, weeks
+### Tier 3 — mixture of experts  *router done (0.6.0), execution planned*
+
+**Status.** The routing half exists and is differential-tested; the execution
+half does not. `wst_moe_router` does softmax over **all** experts then top-k —
+HuggingFace's order, not the obvious one, because selecting first and softmaxing
+the survivors gives different weights and a perfectly valid-looking distribution
+while doing so. Ties break toward the lower index deterministically. Indices and
+weights stay in device memory so a MoE step is still one graph launch rather than
+`k` host round-trips per layer. Tested at the OLMoE (64-of-8), Qwen3-30B-A3B
+(128-of-8) and Mixtral (8-of-2) geometries.
+
+**What is missing:** the expert-gathered GEMV, the convert path for expert
+tensors, the loader, engine dispatch, and expert residency. No MoE checkpoint
+executes.
+
+**And one correction worth carrying, because it inverts the economics below.**
+The optimistic reading — "an 8×7 B model reads what a 13 B dense one does" — is
+right about *bandwidth* and silent about *capacity*. Measured arithmetic for this
+card (5 GB usable, PCIe Gen3 x8 at 5.77 GB/s against DRAM's 278):
+
+| model | stored | read/token | file @4.28bpw | ceiling | **on a 6 GB card** |
+|---|---|---|---|---|---|
+| **OLMoE-1B-7B** | 6.9 B | 631 MB | **3.70 GB** | 441 | **~282** ✅ fits |
+| Qwen1.5-MoE-A2.7B | 13.5 B | 828 MB | 7.21 GB | 336 | **23** ⚠ offload |
+| Qwen3-30B-A3B | 30.5 B | 1627 MB | 16.33 GB | 171 | **5** ❌ offload |
+| Mixtral-8x7B | 46.7 B | 6820 MB | 24.99 GB | 41 | **0.7** ❌ offload |
+
+**Sparsity removes weights from the bandwidth bill, not from the machine.**
+Qwen3-30B-A3B's 109 tok/s roofline becomes ~5 once 72% of its expert traffic
+crosses PCIe. The MoE models worth executing on this card are the ones whose
+*whole expert set* is resident, which today means the ~7 B-total class. (The
+residency figure assumes uniform expert selection, the pessimistic case; real
+routing is skewed and an LRU cache should beat it. By how much is an open
+measurement, and it is the number that decides whether a 30 B model is usable
+here at all.)
+
+### Tier 3 details  planned, weeks
 
 Mixtral, Qwen3-MoE, GLM-4.5, DeepSeek-V2/V3, Kimi.
 

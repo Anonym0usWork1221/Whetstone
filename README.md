@@ -12,19 +12,29 @@ then measures, at every step, whether that actually made anything faster.
 - **Reference GPU:** NVIDIA RTX 2060 — `sm_75` Turing, 30 SMs, 6 GB, 336 GB/s
 - **Stack:** CUDA C++ kernels, Rust engine, Python for evaluation
 
-> **Status (0.5.0): 1.46× llama.cpp Q4_K_M on the reference GPU, at 2.1× its
+> **Status (0.6.0): 1.46× llama.cpp Q4_K_M on the reference GPU, at 2.1× its
 > quantization damage.** 414.0 tok/s against 283.8, and +0.82 perplexity against
 > Q4_K_M's +0.40 — measured in one harness, on llama.cpp's own weights, so the
-> two deltas are the same measurement. 0.3.0 was 1.53× at **10.6×** the damage;
-> the difference is a new weight format that costs 0.03 bits/weight.
+> two deltas are the same measurement.
 >
-> **New in 0.5.0 — one pass over the weights, many tokens.** A multi-token
-> ("chunk") kernel path makes **prefill 3.9× faster** (408.9 → 1288.5 tok/s,
-> output byte-identical), and the same kernels are what make two new flags work:
-> `--vram` runs a model **larger than VRAM** by leaving whole blocks in host RAM,
-> and `--spec` verifies an n-gram draft in one chunk pass. Offloaded, those two
-> together are worth **3.9×** on text that repeats itself. See
-> [Offload and speculation](#offload-and-speculation).
+> **New in 0.6.0.**
+>
+> - **One binary for every NVIDIA GPU since Pascal.** `sm_60` through `sm_90`
+>   plus a PTX tail the driver JITs onto anything newer, in one archive. The old
+>   single-architecture build was justified by the kernels being
+>   architecture-specific; only the *microbenchmark* ever was.
+> - **`--head-rescore`** stores an fp16 copy of the output projection and
+>   recomputes only the logits that decide the token. **85% of the gap to an
+>   fp16 head, at int4-head bandwidth** (16.0220 → 15.4717 perplexity), paid for
+>   in VRAM rather than bytes per token.
+> - **Conversion is 7.0× faster** — 83.4 s → 12.0 s on Qwen2.5-0.5B, output
+>   byte-identical. Qwen2.5-7B converts in 230 s and then **runs at 47.2 tok/s,
+>   perplexity 7.6659** at 4.26 bits/weight.
+> - **QK-RMSNorm**, folded into the RoPE kernels at no extra launch, which
+>   unblocks Qwen3, OLMo2 and Gemma2.
+> - A latent quantizer bug the 7 B model found: the hierarchical format's shared
+>   fp16 row scale could **underflow to zero**, packing whole rows as garbage.
+>   Invisible at 0.5 B, 1.5 B and 3 B.
 
 > **This is a research project, not a production engine.** If you want to run a
 > quantized model today, use [llama.cpp](https://github.com/ggml-org/llama.cpp)
