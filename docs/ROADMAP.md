@@ -260,16 +260,44 @@ those need a different machine, not a different kernel. Their runnable members o
 this card are the distills — `DeepSeek-R1-Distill-Qwen-1.5B`,
 `-Llama-8B` — and both are Tier 1, so both work today.
 
-## Stage 6 — Speculative decoding  planned
+## Stage 6 — Speculative decoding  shipped in 0.5.0, partly
 
-Lossless: the output distribution is provably identical. It also converts the
-memory-bound decode regime into a compute-bound verification regime, which is
-the one regime where the measured 610 TOPS binary tensor-core path could matter.
+Lossless: a draft token is accepted only when it equals the model's own argmax,
+so greedy output is reproduced token for token.
 
-- planned n-gram / prompt-lookup drafting (no draft model needed)
+- **done** Multi-token verification pass (`Engine::forward_chunk`), which is the
+  same kernel work as batched prefill and is what makes offload usable
+- **done** n-gram / prompt-lookup drafting — no draft model needed
 - planned Tree verification
-- planned Dynamic acceptance-rate guard so the worst case is 1.0×, never a
-  regression
+- planned **Dynamic acceptance-rate guard.** Measured worst case today is
+  **0.97×**, not 1.0×: on resident prose the draft almost never fires and the
+  fallback still pays its bookkeeping. The guard should disable drafting after a
+  run of empty rounds. Until it exists, `--spec` is off by default and documented
+  as workload-dependent.
+- planned A draft *model* path. The n-gram draft is free but only fires on
+  self-quoting text; a 0.5B drafting a 3B costs 27% of a target token per draft
+  step, which is too much at the measured chunk cost curve. It becomes viable
+  once the chunk GEMM is nearer its bandwidth bound.
+
+## Stage 6b — The chunk GEMM is compute bound  open
+
+The multi-token GEMM moves weights at ~20 GB/s against the 145 GB/s the
+single-token GEMV achieves, so a 16-token pass costs 4.93 single-token passes
+where it should cost ~1.2. That single number caps resident speculation at 3.25×
+and is now the largest remaining lever.
+
+Measured, in `research/experiments/`:
+
+- `probe_chunk_gemm.cu` — loading activations once per (group, token) and
+  reusing them across `TILE` rows is **2× faster** at every shape. Shipped.
+- `probe_chunk_wmma.cu` — an fp16 `wmma` version is **3× more accurate**
+  (fp32 accumulate) and 1.3–2.4× faster on wide-output shapes, but *slower* on
+  `down_proj` and `o_proj`, and the microbenchmark's run-to-run spread is ~25%.
+  Not shipped: the honest end-to-end win did not clear the noise.
+- Four independent accumulators to break the 16-deep dependent FMA chain: **no
+  effect**. The kernel is not latency bound.
+- A warp-cooperative dequantize to remove a 16-way shared-memory bank conflict:
+  **worse**, because it makes the per-group scale arithmetic 32× redundant.
 
 ## Stage 7 — Packaging  planned
 
@@ -293,7 +321,7 @@ rejected for a stated reason. The full analysis is in the research notes.
 | LUT / product-quantization matmul | GPUs read ~32 shared-memory words per clock against thousands of MACs. The CPU economics invert. |
 | Marlin, FlashAttention-2, BitBLAS kernels | All architected around `cp.async`, which is sm_80+. Turing has no equivalent. |
 | 2:4 structured sparsity | No hardware support on sm_75, and it saves no bytes at low bit widths. |
-| Weight offloading | The model is 264 MB against 6 GB of VRAM. There is nothing to offload. |
+| ~~Weight offloading~~ | **Reversed in 0.5.0.** The original reason — "the model is 264 MB against 6 GB of VRAM" — was true only of the 0.5B reference model. At 3B and above the budget binds, and offload also buys context length: VRAM not spent on weights is KV cache. `--vram` ships. What has *not* changed is the arithmetic: host RAM is ~46× slower than VRAM here, so this buys the ability to run, not speed. |
 | Optimising weight relative error | Measured twice, in both directions: a clip search that *lowers* it raises perplexity by 0.50, and GPTQ *raises* it while lowering perplexity by 1.73. Weight error and output error are different objectives. |
 | Fitting large-model knowledge into a small model | Language models store ~2 bits of knowledge per parameter ([Allen-Zhu & Li, ICLR 2025](https://arxiv.org/abs/2404.05405)). A 0.5B model caps near 1 Gbit; a 1T model holds ~2 Tbit. That ~2,000× gap is an information-capacity limit, not an efficiency one — no quantizer or kernel closes it. The achievable versions are retrieval, task-specific distillation, and speculative decoding (which is provably lossless). |
 | Post-training sub-2-bit on this model | A *training* problem, not a kernel problem. The one credible route, BitDistill (arXiv 2510.13998), needs 10B tokens of continual pre-training plus distillation — infeasible on one 6 GB card. |

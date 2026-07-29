@@ -221,6 +221,24 @@ impl QuantLinear {
         crate::decode::embed_int4(&self.qw, &self.sz, row, out)
     }
 
+    /// Dequantizes `n` rows named by a device-resident id array.
+    pub fn gather_rows(
+        &self,
+        tokens: &DeviceBuffer<i32>,
+        out: &mut DeviceBuffer<f32>,
+        n: usize,
+    ) -> Result<()> {
+        crate::chunk::embed_int4_g128(
+            &self.qw,
+            &self.sz,
+            tokens,
+            out,
+            self.in_features,
+            self.out_features,
+            n,
+        )
+    }
+
     /// `y = W x + b` or `y += W x + b`.
     ///
     /// Bias and accumulation are epilogue flags rather than separate kernels.
@@ -504,6 +522,25 @@ impl QuantLinearHier {
         crate::decode::embed_int4_hier(&self.qw, &self.si, &self.sb, row, out)
     }
 
+    /// Dequantizes `n` rows named by a device-resident id array.
+    pub fn gather_rows(
+        &self,
+        tokens: &DeviceBuffer<i32>,
+        out: &mut DeviceBuffer<f32>,
+        n: usize,
+    ) -> Result<()> {
+        crate::chunk::embed_int4_hier(
+            &self.qw,
+            &self.si,
+            &self.sb,
+            tokens,
+            out,
+            self.in_features,
+            self.out_features,
+            n,
+        )
+    }
+
     /// `y = W x + b`, or `y += W x + b` when `accumulate`.
     pub fn gemv_ex(
         &self,
@@ -557,6 +594,67 @@ impl QuantLinearHier {
     /// `y = W x`.
     pub fn gemv(&self, x: &DeviceBuffer<u16>, y: &mut DeviceBuffer<f32>) -> Result<()> {
         self.gemv_ex(x, None, y, false)
+    }
+
+    /// The multi-token form: `y[j] = W x[j] + b` for every `j < n`.
+    ///
+    /// `x` is `[n][in_features]` and `y` is `[n][out_features]`, token-major. The
+    /// weights are read **once** for all `n` tokens, which is the entire reason
+    /// the chunk path exists — see `cuda/chunk_gemm.cu`.
+    pub fn gemm_ex(
+        &self,
+        x: &DeviceBuffer<u16>,
+        bias: Option<&DeviceBuffer<u16>>,
+        y: &mut DeviceBuffer<f32>,
+        n: usize,
+        accumulate: bool,
+    ) -> Result<()> {
+        if n == 0 {
+            return Err(Error::Shape("gemm_ex: n must be positive".into()));
+        }
+        // At least, not exactly: chunk scratch is allocated once at the maximum
+        // width and used at whatever width the current pass needs.
+        if x.len() < n * self.in_features {
+            return Err(Error::Shape(format!(
+                "gemm_ex: x has {} elements, need {n}*{}",
+                x.len(),
+                self.in_features
+            )));
+        }
+        if y.len() < n * self.out_features {
+            return Err(Error::Shape(format!(
+                "gemm_ex: y has {} elements, need {n}*{}",
+                y.len(),
+                self.out_features
+            )));
+        }
+        if let Some(b) = bias {
+            if b.len() != self.out_features {
+                return Err(Error::Shape(format!(
+                    "gemm_ex: bias has {} elements, expected {}",
+                    b.len(),
+                    self.out_features
+                )));
+            }
+        }
+        let bias_ptr = bias.map_or(std::ptr::null(), DeviceBuffer::as_ptr);
+        // SAFETY: shapes are validated above against the buffers' real lengths,
+        // the bias pointer is null exactly when no bias was supplied, and the
+        // kernel writes only y[0..n*out_features].
+        check(unsafe {
+            ffi::wst_gemm_int4_hier(
+                self.qw.as_ptr(),
+                self.si.as_ptr(),
+                self.sb.as_ptr(),
+                x.as_ptr(),
+                bias_ptr,
+                y.as_mut_ptr(),
+                self.in_features as i32,
+                self.out_features as i32,
+                n as i32,
+                i32::from(accumulate),
+            )
+        })
     }
 }
 

@@ -99,6 +99,52 @@ impl DeviceLinear {
         }
         Ok(())
     }
+
+    /// The multi-token form of [`DeviceLinear::forward`].
+    ///
+    /// `x` is `[n][in_features]` and `y` is `[n][out_features]`, token-major. The
+    /// weights are read once for all `n` tokens — the only thing that changes the
+    /// batch-1 roofline, and the reason prefill, speculative verification and
+    /// weight streaming are all the same piece of work.
+    ///
+    /// The legacy group-128 format has no chunk kernel and says so rather than
+    /// silently falling back to `n` separate GEMVs, which would look like a
+    /// working slow path and hide the real cost.
+    pub fn forward_chunk(
+        &self,
+        x: &DeviceBuffer<u16>,
+        bias: Option<&DeviceBuffer<u16>>,
+        y: &mut DeviceBuffer<f32>,
+        n: usize,
+        accumulate: bool,
+    ) -> Result<()> {
+        match self {
+            Self::Int4Hier(q) => q.gemm_ex(x, bias, y, n, accumulate)?,
+            Self::Fp16 { w, in_features, out_features } => whetstone_kernels::chunk::gemm_fp16(
+                w,
+                x,
+                bias,
+                y,
+                *in_features,
+                *out_features,
+                n,
+                accumulate,
+            )?,
+            Self::Int4(_) => {
+                return Err(Error::Unsupported(
+                    "the int4 group-128 format has no multi-token kernel; convert with the \
+                     default hierarchical format to use chunked prefill or speculative decoding"
+                        .into(),
+                ))
+            }
+        }
+        Ok(())
+    }
+
+    /// True when this layer can run the multi-token path.
+    pub fn supports_chunk(&self) -> bool {
+        !matches!(self, Self::Int4(_))
+    }
 }
 
 /// The embedding matrix, serving both the input gather and the output
@@ -171,6 +217,54 @@ impl Embedding {
         }
         Ok(())
     }
+
+    /// Gathers `n` rows named by a device-resident id array.
+    ///
+    /// The ids live on the device because under speculative decoding they are
+    /// produced by the draft model's argmax and never need to reach the host.
+    pub fn gather_chunk(
+        &self,
+        tokens: &DeviceBuffer<i32>,
+        out: &mut DeviceBuffer<f32>,
+        n: usize,
+    ) -> Result<()> {
+        match self {
+            Self::Fp16 { w, vocab, hidden } => {
+                whetstone_kernels::chunk::embed_fp16(w, tokens, out, *hidden, *vocab, n)?
+            }
+            Self::Int4(q) => q.gather_rows(tokens, out, n)?,
+            Self::Int4Hier(q) => q.gather_rows(tokens, out, n)?,
+        }
+        Ok(())
+    }
+
+    /// `logits[j] = E x[j]` for `n` tokens.
+    pub fn project_chunk(
+        &self,
+        x: &DeviceBuffer<u16>,
+        logits: &mut DeviceBuffer<f32>,
+        n: usize,
+    ) -> Result<()> {
+        match self {
+            Self::Fp16 { w, vocab, hidden } => {
+                whetstone_kernels::chunk::gemm_fp16(w, x, None, logits, *hidden, *vocab, n, false)?
+            }
+            Self::Int4Hier(q) => q.gemm_ex(x, None, logits, n, false)?,
+            Self::Int4(_) => {
+                return Err(Error::Unsupported(
+                    "the int4 group-128 head has no multi-token kernel; reconvert with the \
+                     default hierarchical format"
+                        .into(),
+                ))
+            }
+        }
+        Ok(())
+    }
+
+    /// True when this embedding can run the multi-token output projection.
+    pub fn supports_chunk(&self) -> bool {
+        !matches!(self, Self::Int4(_))
+    }
 }
 
 /// One transformer block's weights.
@@ -237,14 +331,93 @@ pub struct ModelWeights {
     ///
     /// Carried so a `.wstone` needs no sidecar: text in, text out, from one file.
     pub tokenizer_json: Option<String>,
+    /// How the load split the weights between VRAM and host RAM.
+    pub residency: Residency,
+}
+
+/// How a load split the weights between VRAM and host RAM.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Residency {
+    /// Weight bytes resident in VRAM.
+    pub device_bytes: usize,
+    /// Weight bytes left in host RAM, read over PCIe every token.
+    pub host_bytes: usize,
+    /// Transformer blocks kept in VRAM.
+    pub device_layers: usize,
+    /// Transformer blocks left in host RAM.
+    pub host_layers: usize,
+}
+
+impl Residency {
+    /// True when the whole model is in VRAM.
+    pub fn fully_resident(&self) -> bool {
+        self.host_bytes == 0
+    }
+
+    /// Seconds per token this split implies, at the two measured bandwidths.
+    ///
+    /// `device_gbs` is what the GEMV actually attains (not the spec sheet);
+    /// `host_gbs` is the PCIe read rate, 6.0 GB/s on a Gen3 x8 link. The ratio is
+    /// ~46x, which is why this is worth printing rather than inferring.
+    pub fn seconds_per_token(&self, device_gbs: f64, host_gbs: f64) -> f64 {
+        self.device_bytes as f64 / (device_gbs * 1e9) + self.host_bytes as f64 / (host_gbs * 1e9)
+    }
 }
 
 impl ModelWeights {
+    /// Reads a `.wstone` file and uploads it, offloading what does not fit.
+    ///
+    /// `vram_budget` caps the weight bytes placed in VRAM; whole transformer
+    /// blocks past that point are allocated in host RAM and read by the kernels
+    /// over PCIe. `None` means "everything on the device", which is what every
+    /// caller wanted before offload existed.
+    ///
+    /// # Why whole blocks, and why the order does not matter
+    ///
+    /// At batch 1 every weight is read **exactly once per token**, so there is no
+    /// reuse to exploit and no tensor is hotter than any other. Which bytes get
+    /// offloaded therefore cannot affect throughput — only *how many* can. That
+    /// is a genuinely unusual property and it is what makes this policy as good
+    /// as any cleverer one: fill VRAM, spill the remainder, done. (It stops being
+    /// true the moment a chunk pass reuses weights across tokens, which is why
+    /// the chunk path and offload are worth measuring together.)
+    ///
+    /// The embedding and `lm_head` are placed first and never offloaded. Not for
+    /// locality — see above — but because the output projection is 27.6% of a
+    /// tied 0.5B model in a single matrix, so offloading it is a large,
+    /// all-or-nothing step that makes the budget hard to aim.
+    pub fn load_with(path: &Path, vram_budget: Option<usize>) -> Result<Self> {
+        let mut w = Self::load_inner(path, vram_budget)?;
+        w.residency = w.compute_residency();
+        Ok(w)
+    }
+
+    /// Recomputes the device/host split from what was actually allocated.
+    fn compute_residency(&self) -> Residency {
+        let mut r = self.residency;
+        r.device_bytes = self.embed.bytes()
+            + self.lm_head.as_ref().map_or(0, DeviceLinear::bytes)
+            + self.final_norm.bytes();
+        r.host_bytes = 0;
+        for (i, l) in self.layers.iter().enumerate() {
+            if i < r.device_layers {
+                r.device_bytes += l.bytes();
+            } else {
+                r.host_bytes += l.bytes();
+            }
+        }
+        r
+    }
+
     /// Reads a `.wstone` file and uploads it.
     ///
     /// Every tensor the architecture calls for must be present; a missing one is
     /// an error here rather than a silently wrong forward pass later.
     pub fn load(path: &Path) -> Result<Self> {
+        Self::load_with(path, None)
+    }
+
+    fn load_inner(path: &Path, vram_budget: Option<usize>) -> Result<Self> {
         let file = std::fs::File::open(path)
             .map_err(|e| Error::Io(format!("could not open {}: {e}", path.display())))?;
         // SAFETY: the mapping is read-only and lives no longer than this
@@ -263,8 +436,48 @@ impl ModelWeights {
             .map_err(|e| Error::Config(format!("{}: embedded config is unusable: {e}", path.display())))?;
         config.validate()?;
 
+        // Plan the split before allocating anything. The header carries every
+        // tensor's stored size, so this needs no trial allocation -- and a
+        // trial allocation is exactly what must be avoided, because an OOM
+        // partway through a 4 GB upload leaves the driver in a state the next
+        // attempt inherits.
+        let stored = |name: &str| -> u64 {
+            header.tensor(name).map(|t| t.stored_bytes()).unwrap_or(0)
+        };
+        let layer_bytes: u64 = header
+            .tensors
+            .iter()
+            .filter(|t| t.name.starts_with("model.layers.0."))
+            .map(|t| t.stored_bytes())
+            .sum();
+        let fixed_bytes = stored("model.embed_tokens.weight")
+            + stored("lm_head.weight")
+            + stored("model.norm.weight");
+
+        let device_layers = match vram_budget {
+            None => config.num_hidden_layers,
+            Some(budget) => {
+                if !whetstone_kernels::host_alloc_supported() {
+                    return Err(Error::Unsupported(
+                        "this driver cannot allocate host-resident memory, so weights \
+                         cannot be offloaded; run without a VRAM budget"
+                            .into(),
+                    ));
+                }
+                let spare = (budget as u64).saturating_sub(fixed_bytes);
+                let fits = spare
+                    .checked_div(layer_bytes)
+                    .map_or(config.num_hidden_layers, |n| n as usize);
+                fits.min(config.num_hidden_layers)
+            }
+        };
+
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         for l in 0..config.num_hidden_layers {
+            // Every allocation made while this guard is alive lands in host RAM.
+            let _place = (l >= device_layers).then(|| {
+                whetstone_kernels::PlacementGuard::new(whetstone_kernels::Placement::Host)
+            });
             let p = format!("model.layers.{l}");
             layers.push(LayerWeights {
                 input_norm: load_fp16(&header, bytes, &format!("{p}.input_layernorm.weight"))?,
@@ -366,6 +579,11 @@ impl ModelWeights {
         };
 
         Ok(Self {
+            residency: Residency {
+                device_layers,
+                host_layers: config.num_hidden_layers - device_layers,
+                ..Default::default()
+            },
             config,
             layers,
             final_norm,

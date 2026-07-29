@@ -10,7 +10,93 @@ Versioning is [semantic](https://semver.org/), with one project-specific rule:
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-07-29
+
+**One pass over the weights, many tokens.** Every weight had been read once per
+token, which is the whole batch-1 cost model. A multi-token pass changes that,
+and the same piece of kernel work turns out to be prefill, speculative
+verification and the thing that makes weight offload usable — 3.9× faster
+prefill resident, and a model with a third of its blocks in host RAM running at
+3.9× what it would otherwise.
+
 ### Added
+
+- **A multi-token ("chunk") pass over the weights.** `Engine::forward_chunk` runs
+  `n` tokens through the whole stack in **one** pass over the weights, where the
+  decode path reads every weight once per token. New CUDA kernels in
+  `chunk_gemm.cu` and `chunk_ops.cu` cover the GEMM, causal chunk attention,
+  RMSNorm, RoPE with per-position offsets, SwiGLU, the embedding gather and a
+  per-row argmax; activations are token-major `[n][dim]` throughout.
+
+  **Prefill now uses it and is 3.15–3.91× faster** — 408.9 → 1288.5 tok/s on
+  Qwen2.5-0.5B at 4.28 bpw, 330.7 → 1293.8 with an fp16 head. Lossless: the
+  generated token ids are byte-identical to the sequential path, and
+  `WHETSTONE_NO_CHUNK=1` forces the old one for A/B.
+
+  Eight differential tests pin every chunk kernel against the single-token kernel
+  it replaces, on identical inputs.
+
+- **Weight offload: `--vram 3GB` on `run` and `chat`.** Whole transformer blocks past
+  the budget are allocated in host RAM and read by the kernels over PCIe, so a
+  model larger than VRAM runs rather than failing to allocate. The banner reports
+  the split and the tok/s the split implies.
+
+  Placement uses `cudaMallocManaged` **plus** `cudaMemAdvise` with
+  `SetPreferredLocation(CPU)` and `SetAccessedBy(GPU)`. Both are required:
+  measured on a Gen3 x8 link, the same allocation without them runs at
+  **0.47 GB/s against 6.46** — correct, silent, and 13× slower.
+
+  At batch 1 every weight is read exactly once per token, so no tensor is hotter
+  than another and *which* blocks get offloaded cannot affect throughput, only
+  how many. Fill VRAM, spill the rest.
+
+- **Speculative decoding: `--spec 8` on `run` and `chat`.** An n-gram draft (the most
+  recent earlier occurrence of the last few tokens) proposes a continuation and
+  one chunk pass verifies it. A draft token is accepted only when it equals the
+  model's own argmax, so **the output is exactly what greedy decoding produces**
+  — this is a throughput knob with no accuracy cost and no quality gate to clear.
+  A round that finds no match falls back to an ordinary decode step.
+
+  Measured on Qwen2.5-3B (1644 MB at 4.26 bpw), 96 generated tokens, greedy,
+  median of three interleaved runs
+  (`research/experiments/bench_spec_offload.sh`):
+
+  | | prose | repetitive |
+  |---|---|---|
+  | resident | 96.8 tok/s | 90.7 tok/s |
+  | resident, `--spec 8` | **93.7** (0.97×) | 141.1 (1.56×) |
+  | `--vram 1200MB` (11 of 36 blocks off-card) | 11.9 | 11.7 |
+  | `--vram 1200MB --spec 8` | 13.4 (1.13×) | **45.8 (3.92×)** |
+
+  Two things that table is saying, both of which matter more than the best
+  number in it:
+
+  **On prose, resident, speculation is a small net loss** (0.97×). An n-gram
+  draft only fires when the text repeats itself; on open-ended generation almost
+  every round finds no match, falls back to an ordinary decode step, and pays the
+  bookkeeping anyway. This is why `--spec` defaults to off and is documented as
+  workload-dependent rather than as a free win.
+
+  **Offloaded, the same flag is worth 3.9× on the same text it was worth 1.56×
+  on resident.** The mechanism is the chunk cost curve: a 16-token pass costs
+  4.93 single-token passes when the weights are in VRAM — so the ceiling is
+  3.25× no matter how good the draft — but only **1.07** when they are in host
+  RAM, because one 6 GB/s PCIe read serves every token in the chunk. Offload is
+  what makes speculation pay, and speculation is what makes offload usable.
+
+### Changed
+
+- `ModelWeights::load_with` takes a VRAM budget and reports a `Residency` split;
+  `load` is unchanged and keeps everything on the device.
+- The int4-hierarchical chunk GEMM loads activations once per (group, token) and
+  reuses them across `TILE` output rows, with the nibbles unpacked once into
+  registers. The first version re-read them per row and was L1-issue bound —
+  2× slower at every shape. `TILE` rises with the token count here, the opposite
+  of the single-token kernel, because the batch dimension supplies the reuse.
+- Prefill skips the output projection on every chunk but the last. On a tied
+  0.5B the head is 27.6% of the model in one matrix, and computing 512 prompt
+  positions' logits to use one of them was the largest waste in a chunked
+  prefill.
 
 - **Sampling controls in `whetstone chat` and a live `/set`.** `--top-k`,
   `--min-p`, `--repeat-penalty` and `--repeat-last-n` join the existing
@@ -62,6 +148,10 @@ Versioning is [semantic](https://semver.org/), with one project-specific rule:
   families that do not fit.
 
 ### Fixed
+
+- Perplexity is unchanged at 13.8209 on the fp16 reference path (wikitext-2,
+  20 × 2048-token windows). Nothing in this release touches the quantizer or the
+  single-token arithmetic.
 
 - **`--head` now applies to the untied `lm_head`.** Previously it quantized
   `model.embed_tokens.weight` and copied `lm_head.weight` as dense fp16. On a

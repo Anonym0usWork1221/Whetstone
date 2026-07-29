@@ -12,15 +12,19 @@ then measures, at every step, whether that actually made anything faster.
 - **Reference GPU:** NVIDIA RTX 2060 — `sm_75` Turing, 30 SMs, 6 GB, 336 GB/s
 - **Stack:** CUDA C++ kernels, Rust engine, Python for evaluation
 
-> **Status (0.4.0): 1.46× llama.cpp Q4_K_M on the reference GPU, at 2.1× its
+> **Status (0.5.0): 1.46× llama.cpp Q4_K_M on the reference GPU, at 2.1× its
 > quantization damage.** 414.0 tok/s against 283.8, and +0.82 perplexity against
 > Q4_K_M's +0.40 — measured in one harness, on llama.cpp's own weights, so the
 > two deltas are the same measurement. 0.3.0 was 1.53× at **10.6×** the damage;
 > the difference is a new weight format that costs 0.03 bits/weight.
 >
-> Prefill still runs the decode path one token at a time, which is the honest
-> starting point and not what a fast engine does. See
-> [docs/ROADMAP.md](docs/ROADMAP.md).
+> **New in 0.5.0 — one pass over the weights, many tokens.** A multi-token
+> ("chunk") kernel path makes **prefill 3.9× faster** (408.9 → 1288.5 tok/s,
+> output byte-identical), and the same kernels are what make two new flags work:
+> `--vram` runs a model **larger than VRAM** by leaving whole blocks in host RAM,
+> and `--spec` verifies an n-gram draft in one chunk pass. Offloaded, those two
+> together are worth **3.9×** on text that repeats itself. See
+> [Offload and speculation](#offload-and-speculation).
 
 > **This is a research project, not a production engine.** If you want to run a
 > quantized model today, use [llama.cpp](https://github.com/ggml-org/llama.cpp)
@@ -487,6 +491,56 @@ whetstone ppl model.wstone --tokens wikitext2.u32 --window 2048 --windows 20
 whetstone run model.wstone --ids 785 --profile 64
 whetstone tune model.wstone
 ```
+
+### Offload and speculation
+
+Two flags, on both `run` and `chat`. Neither changes what the model outputs.
+
+```bash
+# Run a model that does not fit: whole blocks past the budget stay in host RAM
+# and the kernels read them over PCIe. Frees VRAM for a longer context.
+whetstone chat model.wstone --ctx 32768 --vram 1200MB
+
+# Speculative decoding: an n-gram draft, verified in one multi-token pass.
+# A draft token is accepted only when it equals the model's own argmax, so the
+# output is exactly what greedy decoding produces. Needs --temperature 0.
+whetstone chat model.wstone --temperature 0 --spec 8
+
+# The two together, which is where the win actually is
+whetstone chat model.wstone --ctx 32768 --vram 1200MB --temperature 0 --spec 8
+```
+
+Qwen2.5-3B at 4.26 bpw (1644 MB), 96 generated tokens, greedy, median of three
+interleaved runs — `research/experiments/bench_spec_offload.sh`:
+
+| | prose | repetitive |
+|---|---|---|
+| resident | 96.8 tok/s | 90.7 tok/s |
+| resident, `--spec 8` | **93.7** (0.97×) | 141.1 (1.56×) |
+| `--vram 1200MB` (11 of 36 blocks off-card) | 11.9 | 11.7 |
+| `--vram 1200MB --spec 8` | 13.4 (1.13×) | **45.8 (3.92×)** |
+
+**Read the first row before the last one.** On open-ended prose with the whole
+model resident, `--spec` is a small net *loss*: an n-gram draft only fires when
+the text repeats itself, so nearly every round finds nothing, falls back to an
+ordinary decode step, and pays the bookkeeping anyway. It is off by default and
+it is workload-dependent, not free.
+
+What the table does show is that **offload and speculation multiply each other.**
+A 16-token pass costs 4.93 single-token passes with the weights in VRAM — so
+speculation can never beat 3.25× there however good the draft — but only **1.07**
+with them in host RAM, because one 6 GB/s PCIe read serves every token in the
+chunk. The flag that is worth 1.56× resident is worth 3.9× offloaded.
+
+**What offload cannot do.** Host RAM is ~46× slower than VRAM on this machine
+(6.0 GB/s over a PCIe 3.0 x8 link against 278 GB/s measured on the card). Bits
+per weight divide both, so no quantizer closes that gap, and a model half
+off-card runs at roughly a tenth of resident speed at batch 1. Offload buys the
+ability to run at all, and to spend VRAM on context instead of weights;
+speculation is what buys back the speed, and only on text where the draft lands.
+The full arithmetic, including why trillion-parameter models are a host-RAM
+*capacity* wall long before they are a bandwidth one, is in
+`research/notes/2026-07-29-offload-roofline.md`.
 
 `whetstone chat` keeps the KV cache across turns, so turn twenty prefills only
 its own message rather than the whole transcript, and each reply reports its own

@@ -17,6 +17,7 @@ use std::ffi::{c_char, c_void, CStr};
 use std::fmt;
 use std::marker::PhantomData;
 
+pub mod chunk;
 pub mod decode;
 mod ffi;
 pub mod gemv;
@@ -26,7 +27,10 @@ pub use decode::{
     DeviceCursor, Event, Graph, KvCache, RopeScaling, RopeTable,
 };
 pub use ffi::{DeviceInfo, ProbeResult};
-pub use gemv::{bench_gemv, gemv_fp16, gemv_fp16_ex, variant, GemvBench, QuantLinear, GROUP};
+pub use gemv::{
+    bench_gemv, gemv_fp16, gemv_fp16_ex, variant, GemvBench, QuantLinear, QuantLinearHier,
+    GROUP,
+};
 
 /// Errors crossing the CUDA boundary.
 #[derive(Debug, thiserror::Error)]
@@ -228,9 +232,71 @@ unsafe impl<T: Copy + Send> Send for DeviceBuffer<T> {}
 // SAFETY: `&DeviceBuffer` exposes only reads, which are safe to share.
 unsafe impl<T: Copy + Sync> Sync for DeviceBuffer<T> {}
 
+/// Where an allocation physically lives.
+///
+/// The engine's whole cost model is "bytes per token divided by the bandwidth of
+/// wherever those bytes are", and these are the two bandwidths available:
+/// **278 GB/s** on this card's VRAM against **6.0 GB/s** over its Gen3 x8 link.
+/// A 46x cliff, so which side a tensor lands on is not a detail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Placement {
+    /// Device memory. What every allocation was before offload existed.
+    #[default]
+    Device,
+    /// Host RAM, read by kernels over PCIe. For weights that do not fit.
+    Host,
+}
+
+/// The placement new allocations take, as a process-global.
+///
+/// Global rather than threaded through every constructor because the decision is
+/// made once, at load, for whole tensors at a time — and because the alternative
+/// is a `Placement` parameter on `from_packed` for all three quantized formats
+/// plus every dense path. Use [`PlacementGuard`] rather than setting it directly;
+/// an allocation that lands in host memory by accident is a 46x slowdown with no
+/// error attached to it.
+static PLACEMENT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Scoped override of the allocation placement, restored on drop.
+pub struct PlacementGuard(u8);
+
+impl PlacementGuard {
+    /// Makes subsequent allocations on this process use `p` until dropped.
+    pub fn new(p: Placement) -> Self {
+        let prev = PLACEMENT.swap(p as u8, std::sync::atomic::Ordering::SeqCst);
+        Self(prev)
+    }
+}
+
+impl Drop for PlacementGuard {
+    fn drop(&mut self) {
+        PLACEMENT.store(self.0, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// The placement new allocations currently take.
+pub fn current_placement() -> Placement {
+    if PLACEMENT.load(std::sync::atomic::Ordering::SeqCst) == 1 {
+        Placement::Host
+    } else {
+        Placement::Device
+    }
+}
+
+/// True when the driver can allocate host-resident memory kernels may read.
+pub fn host_alloc_supported() -> bool {
+    // SAFETY: no arguments, returns a device attribute as an int.
+    (unsafe { ffi::wst_host_alloc_supported() }) != 0
+}
+
 impl<T: Copy> DeviceBuffer<T> {
-    /// Allocates `len` uninitialised elements on the device.
+    /// Allocates `len` uninitialised elements at the current [`Placement`].
     pub fn new(len: usize) -> Result<Self> {
+        Self::new_at(len, current_placement())
+    }
+
+    /// Allocates `len` uninitialised elements at an explicit placement.
+    pub fn new_at(len: usize, placement: Placement) -> Result<Self> {
         let bytes = len
             .checked_mul(std::mem::size_of::<T>())
             .ok_or_else(|| Error::InvalidArg("allocation size overflowed usize".into()))?;
@@ -238,7 +304,14 @@ impl<T: Copy> DeviceBuffer<T> {
         let mut ptr: *mut c_void = std::ptr::null_mut();
         // SAFETY: `ptr` is a valid out-parameter we exclusively own; on failure
         // the callee leaves it null and we propagate the error without using it.
-        check(unsafe { ffi::wst_malloc(&mut ptr, bytes) })?;
+        // Both allocators return a pointer `wst_free` accepts, so `Drop` does not
+        // need to know which one ran.
+        check(unsafe {
+            match placement {
+                Placement::Device => ffi::wst_malloc(&mut ptr, bytes),
+                Placement::Host => ffi::wst_malloc_host(&mut ptr, bytes),
+            }
+        })?;
 
         Ok(Self { ptr, len, _marker: PhantomData })
     }
@@ -342,6 +415,47 @@ impl<T: Copy> DeviceBuffer<T> {
         // readable from `src.ptr` and writable at `self.ptr`; both are live
         // device allocations owned by their respective buffers.
         check(unsafe { ffi::wst_memcpy_d2d(self.ptr, src.ptr, self.bytes()) })
+    }
+
+    /// Copies `len` elements starting at `src_start` of `src` into the front of
+    /// this buffer, without a host round trip.
+    ///
+    /// The chunk path needs exactly one row out of a `[n][vocab]` logit block —
+    /// the last position's — to hand back to the single-token sampler. Going via
+    /// the host would be 608 KB each way over a 5.8 GB/s link.
+    pub fn copy_range_from_device(
+        &self,
+        src: &DeviceBuffer<T>,
+        src_start: usize,
+        len: usize,
+    ) -> Result<()> {
+        if src_start + len > src.len {
+            return Err(Error::Shape(format!(
+                "source range [{src_start}, {}) exceeds its {} elements",
+                src_start + len,
+                src.len
+            )));
+        }
+        if len > self.len {
+            return Err(Error::Shape(format!(
+                "cannot copy {len} elements into a buffer of {}",
+                self.len
+            )));
+        }
+        if len == 0 {
+            return Ok(());
+        }
+        let esz = std::mem::size_of::<T>();
+        // SAFETY: the source range is checked to lie inside `src` and the
+        // destination range inside `self`, both are live device allocations, and
+        // the byte count is derived from the same element size as both buffers.
+        check(unsafe {
+            ffi::wst_memcpy_d2d(
+                self.ptr,
+                (src.ptr as *const u8).add(src_start * esz) as *const c_void,
+                len * esz,
+            )
+        })
     }
 
     /// Downloads the whole buffer into a fresh `Vec`.

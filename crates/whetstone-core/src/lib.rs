@@ -26,12 +26,14 @@ pub mod engine;
 pub mod error;
 pub mod model;
 pub mod safetensors;
+pub mod speculate;
 pub mod tokenizer;
 
 pub use checkpoint::Checkpoint;
 pub use config::{Architecture, ModelConfig, Roofline, RopeScalingConfig};
 pub use engine::{Engine, Profile, RunStats, Sampler, SamplingConfig};
 pub use error::{Error, Result};
-pub use model::{DeviceLinear, Embedding, LayerWeights, ModelWeights};
+pub use model::{DeviceLinear, Embedding, LayerWeights, ModelWeights, Residency};
+pub use speculate::{SpecConfig, SpecStats};
 pub use safetensors::{Dtype, SafeTensors, TensorView};
 pub use tokenizer::{StreamDecoder, Tokenizer};

@@ -100,6 +100,61 @@ extern "C" wst_status_t wst_malloc(void **out_ptr, size_t bytes) {
   return WST_OK;
 }
 
+/* An allocation that stays in host RAM and is read by kernels over PCIe.
+ *
+ * # Why managed memory with an advice pair, and not the obvious alternatives
+ *
+ * Measured on this machine (research/experiments/probe_offload.cu, Gen3 x8):
+ *
+ *     cudaMallocManaged, fault-driven migration        0.47 GB/s   <- the trap
+ *     cudaHostAlloc(Mapped), kernel reads host         5.13 GB/s
+ *     cudaMemcpy pinned H2D, then read from VRAM       5.77 GB/s
+ *     cudaMallocManaged + PreferredLocation(CPU)
+ *                        + AccessedBy(GPU)             6.46 GB/s   <- this
+ *
+ * Plain managed memory *works* -- it allocates, the kernel runs, the output is
+ * correct -- and it is **thirteen times slower** than the same allocation with
+ * two advice calls, because every page migrates in and back out again on a
+ * working set that cannot fit. That failure is invisible: no error, no warning,
+ * just a model that reads as if the quantizer were broken.
+ *
+ * `SetPreferredLocation(cudaCpuDeviceId)` stops the migration and
+ * `SetAccessedBy(device)` establishes the mapping, leaving plain PCIe reads --
+ * which is the honest ceiling for a weight that does not fit in VRAM.
+ *
+ * Freed with `wst_free`: `cudaFree` accepts managed pointers, so the caller does
+ * not have to remember which allocator produced a buffer.
+ */
+extern "C" wst_status_t wst_malloc_host(void **out_ptr, size_t bytes) {
+  WST_REQUIRE(out_ptr != nullptr, "wst_malloc_host: null out_ptr");
+  *out_ptr = nullptr;
+  if (bytes == 0) return WST_OK;
+
+  int device = 0;
+  WST_TRY(cudaGetDevice(&device));
+
+  void *p = nullptr;
+  cudaError_t e = cudaMallocManaged(&p, bytes);
+  if (e != cudaSuccess) {
+    snprintf(wst_err_buf, sizeof(wst_err_buf),
+             "wst_malloc_host: could not allocate %.1f MB of host-resident memory (%s)",
+             bytes / 1e6, cudaGetErrorString(e));
+    return e == cudaErrorMemoryAllocation ? WST_ERR_OOM : WST_ERR_CUDA;
+  }
+
+  /* Not optional. Without both of these the allocation runs at 0.47 GB/s. */
+  cudaMemAdvise(p, bytes, cudaMemAdviseSetPreferredLocation, cudaCpuDeviceId);
+  cudaMemAdvise(p, bytes, cudaMemAdviseSetAccessedBy, device);
+  return (*out_ptr = p), WST_OK;
+}
+
+/* Whether the driver reports host-resident allocation as usable at all. */
+extern "C" int32_t wst_host_alloc_supported(void) {
+  int managed = 0;
+  if (cudaDeviceGetAttribute(&managed, cudaDevAttrManagedMemory, 0) != cudaSuccess) return 0;
+  return managed;
+}
+
 extern "C" wst_status_t wst_free(void *ptr) {
   if (ptr == nullptr) return WST_OK;
   WST_TRY(cudaFree(ptr));

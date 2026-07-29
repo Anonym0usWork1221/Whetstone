@@ -48,8 +48,8 @@ pub fn rmsnorm(
 /// live — or a double-precision `sincos` at 1/32 rate. The table is 1 MB at 4k
 /// context and turns the whole thing into two loads.
 pub struct RopeTable {
-    cos: DeviceBuffer<f32>,
-    sin: DeviceBuffer<f32>,
+    pub(crate) cos: DeviceBuffer<f32>,
+    pub(crate) sin: DeviceBuffer<f32>,
     /// Positions the table covers.
     pub max_seq: usize,
     /// Rotated pair count, `head_dim / 2`.
@@ -160,8 +160,8 @@ impl RopeTable {
 /// head hit the same lines, so the 7:1 grouping saves L2 traffic as well as
 /// capacity.
 pub struct KvCache {
-    k: DeviceBuffer<u16>,
-    v: DeviceBuffer<u16>,
+    pub(crate) k: DeviceBuffer<u16>,
+    pub(crate) v: DeviceBuffer<u16>,
     /// Per-slice partial softmaxes, for the sequence-split attention.
     partials: DeviceBuffer<f32>,
     /// Key/value head count.

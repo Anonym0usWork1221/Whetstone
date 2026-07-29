@@ -38,6 +38,36 @@ pub struct RunArgs<'a> {
     /// weights sweep past exactly once. Selecting the arithmetic-free `mem`
     /// variant here measures the memory path under real cache pressure.
     pub gemv_variant: Option<i32>,
+    /// VRAM budget for weights. `None` keeps everything on the device.
+    pub vram: Option<String>,
+    /// Draft width for speculative decoding. `0` disables.
+    pub spec: usize,
+}
+
+/// Parses `"3GB"`, `"512MB"`, `"2.5g"` or a plain byte count.
+///
+/// Spelled out rather than taken as raw bytes because the number this trades
+/// against is measured in gigabytes and a slipped factor of 1000 silently moves
+/// whole layers across a 46x bandwidth cliff.
+pub fn parse_bytes(s: &str) -> Result<usize> {
+    let t = s.trim().to_ascii_lowercase();
+    let (num, mult) = if let Some(v) = t.strip_suffix("gb").or_else(|| t.strip_suffix('g')) {
+        (v, 1u64 << 30)
+    } else if let Some(v) = t.strip_suffix("mb").or_else(|| t.strip_suffix('m')) {
+        (v, 1u64 << 20)
+    } else if let Some(v) = t.strip_suffix("kb").or_else(|| t.strip_suffix('k')) {
+        (v, 1u64 << 10)
+    } else {
+        (t.as_str(), 1u64)
+    };
+    let v: f64 = num
+        .trim()
+        .parse()
+        .map_err(|_| anyhow::anyhow!("could not parse a size from {s:?}; try \"3GB\""))?;
+    if !(v.is_finite() && v > 0.0) {
+        bail!("VRAM budget must be a positive size, got {s:?}");
+    }
+    Ok((v * mult as f64) as usize)
 }
 
 pub fn run(args: RunArgs<'_>) -> Result<()> {
@@ -45,10 +75,13 @@ pub fn run(args: RunArgs<'_>) -> Result<()> {
         bail!("no prompt tokens; pass --ids or --prompt");
     }
 
+    let budget = args.vram.as_deref().map(parse_bytes).transpose()?;
+
     let t0 = Instant::now();
-    let weights = ModelWeights::load(args.model)
+    let weights = ModelWeights::load_with(args.model, budget)
         .with_context(|| format!("could not load {}", args.model.display()))?;
     let load_s = t0.elapsed().as_secs_f64();
+    let residency = weights.residency;
 
     let cfg_desc = {
         let c = &weights.config;
@@ -86,6 +119,25 @@ pub fn run(args: RunArgs<'_>) -> Result<()> {
             "  kv cache + rope    {:.1} MB at ctx {ctx}",
             engine.state_bytes() as f64 / 1e6
         );
+        if !residency.fully_resident() {
+            // PCIe Gen3 x8 measured at 6.0 GB/s against this card's 278 for VRAM
+            // -- see research/notes/2026-07-29-offload-roofline.md. The predicted
+            // rate is printed next to the achieved one so the gap is visible
+            // rather than inferred.
+            let host_gbs = 6.0;
+            let pred = 1.0 / residency.seconds_per_token(peak * 0.5, host_gbs);
+            println!(
+                "  OFFLOAD            {} of {} blocks in host RAM ({:.1} MB over PCIe/token)",
+                residency.host_layers,
+                residency.host_layers + residency.device_layers,
+                residency.host_bytes as f64 / 1e6
+            );
+            println!(
+                "  offload roofline   {pred:.1} tok/s   ({:.1} MB resident + {:.1} MB at {host_gbs:.1} GB/s)",
+                residency.device_bytes as f64 / 1e6,
+                residency.host_bytes as f64 / 1e6
+            );
+        }
         println!(
             "  roofline           {:.0} tok/s at {peak:.0} GB/s peak",
             peak * 1e9 / decode_bytes as f64
@@ -145,10 +197,25 @@ pub fn run(args: RunArgs<'_>) -> Result<()> {
     };
 
     let mut out_ids: Vec<u32> = Vec::with_capacity(args.max_new);
-    let stats = engine.generate(&args.ids, args.max_new, sampler, |t| {
-        out_ids.push(t);
-        true
-    })?;
+    let mut spec_stats = None;
+    let stats = if args.spec > 1 {
+        if !matches!(sampler, Sampler::Greedy) {
+            bail!("--spec currently verifies greedily; pass --temperature 0");
+        }
+        let cfg = whetstone_core::SpecConfig { draft: args.spec, ..Default::default() };
+        let (s, sp) =
+            whetstone_core::speculate::generate(&mut engine, &args.ids, args.max_new, cfg, |t| {
+                out_ids.push(t);
+                true
+            })?;
+        spec_stats = Some(sp);
+        s
+    } else {
+        engine.generate(&args.ids, args.max_new, sampler, |t| {
+            out_ids.push(t);
+            true
+        })?
+    };
 
     if let Some(path) = args.dump_logits {
         let logits = engine.logits()?;
@@ -182,6 +249,17 @@ pub fn run(args: RunArgs<'_>) -> Result<()> {
         stats.generated,
         stats.decode_seconds
     );
+    if let Some(sp) = spec_stats {
+        println!(
+            "  speculation        {:.2} tok/pass   ({} accepted of {} proposed, {:.0}%; {} of {} rounds had no draft)",
+            sp.tokens_per_round(),
+            sp.accepted,
+            sp.proposed,
+            sp.acceptance() * 100.0,
+            sp.empty_rounds,
+            sp.rounds
+        );
+    }
     if let Some((p10, p50, p90)) = stats.latency_percentiles() {
         println!("  latency            p50 {p50:.2} ms   (p10 {p10:.2}, p90 {p90:.2})");
         // A spread this wide means the measurement is dominated by whatever else

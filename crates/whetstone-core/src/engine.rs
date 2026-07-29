@@ -190,10 +190,82 @@ impl RunStats {
     }
 }
 
+/// Whether prefill takes the chunked path.
+///
+/// `WHETSTONE_NO_CHUNK=1` forces the old one-token-at-a-time prefill. An A/B
+/// that costs one environment variable is an A/B that actually gets run, and
+/// this one has to stay runnable: chunked prefill must produce *bit-identical*
+/// greedy output to sequential prefill, and the only way to keep believing that
+/// is to be able to check it on any model at any time.
+fn chunk_prefill_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| !matches!(std::env::var("WHETSTONE_NO_CHUNK").as_deref(), Ok("1")))
+}
+
+/// Activation buffers for a multi-token pass, token-major `[width][dim]`.
+///
+/// Allocated lazily and only once: a chunk pass is worth roughly 10 MB of
+/// scratch at width 16 (the logit block is `width * vocab` fp32, which is 9.7 MB
+/// on a 151936 vocabulary and dwarfs everything else), and a model loaded purely
+/// to run single-token decode should not pay it.
+struct ChunkActs {
+    /// Tokens this scratch can serve in one pass.
+    width: usize,
+    x: DeviceBuffer<f32>,
+    h: DeviceBuffer<u16>,
+    qkv: DeviceBuffer<f32>,
+    attn: DeviceBuffer<u16>,
+    gate_up: DeviceBuffer<f32>,
+    act: DeviceBuffer<u16>,
+    logits: DeviceBuffer<f32>,
+    /// Input token ids for the pass, on the device so a draft model's argmax can
+    /// feed the target's gather without a host round trip.
+    tokens: DeviceBuffer<i32>,
+    /// Per-position greedy choice, filled by the batched argmax.
+    picks: DeviceBuffer<i32>,
+}
+
+impl ChunkActs {
+    fn new(c: &crate::ModelConfig, width: usize) -> Result<Self> {
+        let hidden = c.hidden_size;
+        let hd = c.head_dim();
+        let n_q = c.num_attention_heads;
+        let n_kv = c.n_kv_heads();
+        let inter = c.intermediate_size;
+        Ok(Self {
+            width,
+            x: DeviceBuffer::zeros(width * hidden)?,
+            h: DeviceBuffer::zeros(width * hidden)?,
+            qkv: DeviceBuffer::zeros(width * (n_q + 2 * n_kv) * hd)?,
+            attn: DeviceBuffer::zeros(width * n_q * hd)?,
+            gate_up: DeviceBuffer::zeros(width * 2 * inter)?,
+            act: DeviceBuffer::zeros(width * inter)?,
+            logits: DeviceBuffer::zeros(width * c.vocab_size)?,
+            tokens: DeviceBuffer::zeros(width)?,
+            picks: DeviceBuffer::zeros(width)?,
+        })
+    }
+
+    fn bytes(&self) -> usize {
+        self.x.bytes()
+            + self.h.bytes()
+            + self.qkv.bytes()
+            + self.attn.bytes()
+            + self.gate_up.bytes()
+            + self.act.bytes()
+            + self.logits.bytes()
+            + self.tokens.bytes()
+            + self.picks.bytes()
+    }
+}
+
 /// A loaded model plus everything a decode step needs.
 pub struct Engine {
     weights: ModelWeights,
     acts: Activations,
+    /// Scratch for the multi-token path. `None` until a chunk pass is asked for.
+    chunk: Option<ChunkActs>,
     caches: Vec<decode::KvCache>,
     rope: decode::RopeTable,
     /// Tokens currently in the KV cache. Mirrors the device cursor, and exists
@@ -259,6 +331,7 @@ impl Engine {
         Ok(Self {
             weights,
             acts,
+            chunk: None,
             caches,
             rope,
             pos: 0,
@@ -344,9 +417,17 @@ impl Engine {
         self.max_seq
     }
 
-    /// Device bytes held by the KV cache and rotary table.
+    /// Device bytes held by the KV cache, rotary table and chunk scratch.
     pub fn state_bytes(&self) -> usize {
-        self.caches.iter().map(decode::KvCache::bytes).sum::<usize>() + self.rope.bytes()
+        self.caches.iter().map(decode::KvCache::bytes).sum::<usize>()
+            + self.rope.bytes()
+            + self.chunk.as_ref().map_or(0, ChunkActs::bytes)
+    }
+
+    /// Device bytes held by the multi-token scratch, zero until a chunk pass has
+    /// been asked for. Dominated by the `[width][vocab]` logit block.
+    pub fn chunk_bytes(&self) -> usize {
+        self.chunk.as_ref().map_or(0, ChunkActs::bytes)
     }
 
     /// Discards the KV cache and returns to position zero.
@@ -371,6 +452,17 @@ impl Engine {
         self.acts.token.set(token as i32)?;
         self.note(token);
         self.step()
+    }
+
+    /// Drops the last `k` tokens from the repetition-penalty window.
+    ///
+    /// Speculative rounds feed the whole draft through the chunk pass, which
+    /// notes every input; the rejected tail then has to come back out or a
+    /// token the model never emitted would be penalised.
+    pub(crate) fn unnote(&mut self, k: usize) {
+        for _ in 0..k.min(self.recent.len()) {
+            self.recent.pop_back();
+        }
     }
 
     /// Records a token in the repetition-penalty window.
@@ -516,6 +608,27 @@ impl Engine {
         Ok(self.acts.logits.to_vec()?)
     }
 
+    /// Reads the greedy choice the last pass left in the device cursor.
+    ///
+    /// Unlike [`Engine::sample`] this does **not** add the token to the
+    /// repetition window: under speculation a token is not confirmed until the
+    /// verification pass agrees with it, and the pass that feeds it back in does
+    /// the noting.
+    pub fn greedy_pick(&self) -> Result<u32> {
+        Ok(self.acts.token.get()? as u32)
+    }
+
+    /// Puts `token` where the next step's embedding gather will look.
+    ///
+    /// After a rejected speculative round the device cursor holds the argmax of
+    /// the chunk's *last* position, which is not the token that was accepted.
+    /// Leaving it stale would be a silent wrong-token bug the moment anything
+    /// else read it.
+    pub fn set_pending(&mut self, token: u32) -> Result<()> {
+        self.acts.token.set(token as i32)?;
+        Ok(())
+    }
+
     /// Picks the next token from the logits already on the device.
     pub fn sample(&mut self, sampler: Sampler, step: u64) -> Result<u32> {
         match sampler {
@@ -543,13 +656,221 @@ impl Engine {
         }
     }
 
-    /// Feeds a prompt, returning the logits position for the last token.
+    /// Tokens one multi-token pass serves before the weights must be re-read.
     ///
-    /// Prefill runs the same single-token path in a loop. That is the honest
-    /// starting point and it is not what a fast engine does — prefill is
-    /// compute bound, so it wants a batched GEMM path. Until that exists this
-    /// is `prompt_len` decode steps, and the reported prefill rate says so.
+    /// Defaults to the kernel's slice width. `WHETSTONE_CHUNK_WIDTH=k` overrides
+    /// it, which is how the cost curve `c(k)` — what a k-token pass costs in
+    /// units of single-token passes — gets measured. That curve is the whole
+    /// economics of speculative decoding: a round produces at most `k` tokens
+    /// for `c(k)` tokens' worth of work, so `c(k) < k` is the entire question.
+    pub fn chunk_width(&self) -> usize {
+        use std::sync::OnceLock;
+        static W: OnceLock<usize> = OnceLock::new();
+        *W.get_or_init(|| {
+            let max = whetstone_kernels::chunk::max_tokens();
+            std::env::var("WHETSTONE_CHUNK_WIDTH")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|&k| k >= 1)
+                .map_or(max, |k| k.min(max))
+        })
+    }
+
+    /// True when every weight in the model has a multi-token kernel.
+    ///
+    /// Only the legacy int4 group-128 format does not. Reported rather than
+    /// silently worked around, because the fallback — `n` separate GEMVs — has
+    /// none of the properties the chunk path exists for.
+    pub fn supports_chunk(&self) -> bool {
+        self.weights.embed.supports_chunk()
+            && self.weights.lm_head.as_ref().map_or(true, |h| h.supports_chunk())
+            && self.weights.layers.iter().all(|l| {
+                l.qkv_proj.supports_chunk()
+                    && l.o_proj.supports_chunk()
+                    && l.gate_up_proj.supports_chunk()
+                    && l.down_proj.supports_chunk()
+            })
+    }
+
+    /// Allocates the chunk scratch if it is not already present.
+    fn ensure_chunk(&mut self) -> Result<usize> {
+        let width = self.chunk_width();
+        if self.chunk.as_ref().map_or(true, |c| c.width < width) {
+            self.chunk = Some(ChunkActs::new(&self.weights.config, width)?);
+        }
+        Ok(width)
+    }
+
+    /// Runs `tokens` through the whole stack in **one pass over the weights**.
+    ///
+    /// The tokens are appended at the current position and the cache advances by
+    /// `tokens.len()`. Afterwards the engine's single-token state is consistent
+    /// with having run the same tokens one at a time: `logits` holds the last
+    /// position's distribution and the device token cursor holds its argmax, so
+    /// [`Engine::sample`] and [`Engine::step`] work unchanged.
+    ///
+    /// Per-position logits stay on the device. [`Engine::chunk_picks`] reads back
+    /// the greedy choice at every position, which is all speculative
+    /// verification needs and is `n` integers rather than `n * vocab` floats.
+    pub fn forward_chunk(&mut self, tokens: &[u32]) -> Result<()> {
+        self.forward_chunk_ex(tokens, true)
+    }
+
+    /// [`Engine::forward_chunk`] with the output projection made optional.
+    ///
+    /// `want_logits = false` runs the blocks and the cache append but stops
+    /// before the final norm, the head and the argmax. Prefill wants this for
+    /// every chunk except the last: it needs the *cache*, not the predictions,
+    /// and on Qwen2.5-0.5B the head is 27.6% of the model in one matrix — over
+    /// half of it when the head is left in fp16. Computing 512 prompt positions'
+    /// logits to use one of them is the single largest waste in a chunked
+    /// prefill.
+    ///
+    /// The engine's single-token state (`logits`, the token cursor) is left
+    /// untouched when the head is skipped, so the caller must run at least one
+    /// pass with `want_logits` before sampling.
+    pub fn forward_chunk_ex(&mut self, tokens: &[u32], want_logits: bool) -> Result<()> {
+        let n = tokens.len();
+        if n == 0 {
+            return Err(crate::Error::Shape("forward_chunk: empty chunk".into()));
+        }
+        if !self.supports_chunk() {
+            return Err(crate::Error::Unsupported(
+                "this model's weight format has no multi-token kernel".into(),
+            ));
+        }
+        let width = self.ensure_chunk()?;
+        if n > width {
+            return Err(crate::Error::Shape(format!(
+                "forward_chunk: {n} tokens exceeds the {width} token chunk width"
+            )));
+        }
+        if self.pos + n > self.max_seq {
+            return Err(crate::Error::Shape(format!(
+                "forward_chunk: {n} tokens at position {} exceeds the {} token cache",
+                self.pos, self.max_seq
+            )));
+        }
+
+        let pos0 = self.pos;
+        let c = &self.weights.config;
+        let eps = c.rms_norm_eps;
+        let hidden = c.hidden_size;
+        let inter = c.intermediate_size;
+        let n_q = c.num_attention_heads;
+        let vocab = c.vocab_size;
+
+        // Disjoint field borrows: the chunk scratch, the weights, the caches and
+        // the rotary table are four separate fields of `self`.
+        let ch = self.chunk.as_mut().expect("ensure_chunk allocated it");
+        let w = &self.weights;
+        let caches = &mut self.caches;
+        let rope = &self.rope;
+
+        let mut ids = vec![0i32; ch.width];
+        for (slot, &t) in ids.iter_mut().zip(tokens) {
+            *slot = t as i32;
+        }
+        ch.tokens.copy_from_host(&ids)?;
+
+        w.embed.gather_chunk(&ch.tokens, &mut ch.x, n)?;
+
+        for (l, layer) in w.layers.iter().enumerate() {
+            whetstone_kernels::chunk::rmsnorm_eps(&ch.x, &layer.input_norm, &mut ch.h, hidden, n, eps)?;
+            layer.qkv_proj.forward_chunk(&ch.h, layer.qkv_bias.as_ref(), &mut ch.qkv, n, false)?;
+
+            whetstone_kernels::chunk::rope_cache(&mut ch.qkv, &mut caches[l], rope, n_q, pos0, n)?;
+            whetstone_kernels::chunk::attn(&ch.qkv, &caches[l], &mut ch.attn, n_q, pos0, n)?;
+
+            layer.o_proj.forward_chunk(&ch.attn, None, &mut ch.x, n, true)?;
+
+            whetstone_kernels::chunk::rmsnorm_eps(
+                &ch.x,
+                &layer.post_attn_norm,
+                &mut ch.h,
+                hidden,
+                n,
+                eps,
+            )?;
+            layer.gate_up_proj.forward_chunk(&ch.h, None, &mut ch.gate_up, n, false)?;
+            whetstone_kernels::chunk::swiglu(&ch.gate_up, &mut ch.act, inter, n)?;
+            layer.down_proj.forward_chunk(&ch.act, None, &mut ch.x, n, true)?;
+        }
+
+        if want_logits {
+            whetstone_kernels::chunk::rmsnorm_eps(&ch.x, &w.final_norm, &mut ch.h, hidden, n, eps)?;
+            match &w.lm_head {
+                Some(head) => head.forward_chunk(&ch.h, None, &mut ch.logits, n, false)?,
+                None => w.embed.project_chunk(&ch.h, &mut ch.logits, n)?,
+            }
+            whetstone_kernels::chunk::argmax(&ch.logits, &mut ch.picks, vocab, n)?;
+
+            // Hand the last position back to the single-token path. Both copies
+            // stay on the device: the logit row is 608 KB and the id is 4 bytes.
+            self.acts.logits.copy_range_from_device(&ch.logits, (n - 1) * vocab, vocab)?;
+            self.acts.token.buffer_mut().copy_range_from_device(&ch.picks, n - 1, 1)?;
+        }
+
+        self.pos = pos0 + n;
+        self.acts.pos_dev.set(self.pos as i32)?;
+        for &t in tokens {
+            self.note(t);
+        }
+        Ok(())
+    }
+
+    /// Greedy choice at each of the first `n` positions of the last chunk pass.
+    ///
+    /// `picks[j]` is the token the target model would emit after consuming input
+    /// `j` — which is exactly what speculative verification compares against.
+    pub fn chunk_picks(&self, n: usize) -> Result<Vec<u32>> {
+        let ch = self
+            .chunk
+            .as_ref()
+            .ok_or_else(|| crate::Error::Shape("no chunk pass has run".into()))?;
+        if n > ch.width {
+            return Err(crate::Error::Shape(format!(
+                "chunk_picks: {n} exceeds the {} token chunk width",
+                ch.width
+            )));
+        }
+        let all = ch.picks.to_vec()?;
+        Ok(all[..n].iter().map(|&v| v.max(0) as u32).collect())
+    }
+
+    /// Rewinds the cache cursor to `pos`, discarding everything after it.
+    ///
+    /// Nothing is erased: attention reads only entries below the cursor, so a
+    /// rejected speculative branch is overwritten by the next write rather than
+    /// cleared. This is what makes rollback free.
+    pub fn rewind(&mut self, pos: usize) -> Result<()> {
+        if pos > self.pos {
+            return Err(crate::Error::Shape(format!(
+                "rewind: {pos} is ahead of the current position {}",
+                self.pos
+            )));
+        }
+        self.pos = pos;
+        self.acts.pos_dev.set(pos as i32)?;
+        Ok(())
+    }
+
+    /// Feeds a prompt.
+    ///
+    /// Chunked when the weight format allows it: prefill is the one part of a
+    /// batch-1 engine that is *not* inherently bandwidth bound, because every
+    /// prompt token needs the same weights. Running it as `prompt_len` decode
+    /// steps re-reads the entire model once per token — 264 MB per prompt token
+    /// on Qwen2.5-0.5B — where one chunk pass reads it once for sixteen.
     pub fn prefill(&mut self, tokens: &[u32]) -> Result<()> {
+        if tokens.len() > 1 && self.supports_chunk() && chunk_prefill_enabled() {
+            let width = self.chunk_width();
+            let last = (tokens.len() - 1) / width;
+            for (i, part) in tokens.chunks(width).enumerate() {
+                self.forward_chunk_ex(part, i == last)?;
+            }
+            return Ok(());
+        }
         for &t in tokens {
             self.forward(t)?;
         }

@@ -81,6 +81,13 @@ const char *wst_last_error(void);
 
 wst_status_t wst_malloc(void **out_ptr, size_t bytes);
 wst_status_t wst_free(void *ptr);
+
+/* Allocate in host RAM, readable by kernels over PCIe. For weights that do not
+ * fit in VRAM. Freed with wst_free. See runtime.cu for why this is managed
+ * memory plus two cudaMemAdvise calls and not any of the obvious alternatives --
+ * the naive form is 13x slower and fails silently. */
+wst_status_t wst_malloc_host(void **out_ptr, size_t bytes);
+int32_t wst_host_alloc_supported(void);
 wst_status_t wst_memset(void *dst, int32_t value, size_t bytes);
 wst_status_t wst_memcpy_h2d(void *dst, const void *src_host, size_t bytes);
 wst_status_t wst_memcpy_d2h(void *dst_host, const void *src, size_t bytes);
@@ -283,6 +290,49 @@ wst_status_t wst_argmax(const void *logits, void *out_idx, int32_t n);
  * passes, and copying a scalar back after each one would put a synchronising
  * transfer inside a loop that otherwise never blocks. */
 wst_status_t wst_nll(const void *logits, int32_t target, void *acc, int32_t n);
+
+/* ------------------------------------------------------- multi-token chunk */
+
+/* The batched forms of the decode step. Every activation buffer is token-major
+ * [n][dim]; `pos0` is the cache position of the chunk's first token, passed by
+ * value because a chunk pass is not graph-captured (its width changes with the
+ * speculative acceptance length).
+ *
+ * These exist so a weight can be read once and used for n tokens. See
+ * cuda/chunk_gemm.cu for why that is the only lever that changes the batch-1
+ * roofline. */
+
+/* Largest token count a single weight pass covers; wider requests are sliced. */
+int32_t wst_chunk_max_tokens(void);
+
+wst_status_t wst_gemm_int4_hier(const void *qw, const void *si, const void *sb,
+                                const void *x, const void *bias, void *y, int32_t in_f,
+                                int32_t out_f, int32_t n, int32_t accum);
+wst_status_t wst_gemm_fp16(const void *w, const void *x, const void *bias, void *y,
+                           int32_t in_f, int32_t out_f, int32_t n, int32_t accum);
+
+wst_status_t wst_rmsnorm_chunk(const void *x, const void *w, void *out, int32_t dim,
+                               int32_t n, float eps);
+wst_status_t wst_rope_cache_chunk(void *qkv, void *k_cache, void *v_cache,
+                                  const void *cos_tab, const void *sin_tab, int32_t n_q,
+                                  int32_t n_kv, int32_t head_dim, int32_t pos0, int32_t n,
+                                  int32_t max_seq);
+wst_status_t wst_attn_chunk(const void *qkv, const void *k_cache, const void *v_cache,
+                            void *out, int32_t n_q, int32_t n_kv, int32_t head_dim,
+                            int32_t pos0, int32_t n, int32_t max_seq, float scale);
+wst_status_t wst_swiglu_chunk(const void *gate_up, void *out, int32_t inter, int32_t n);
+
+wst_status_t wst_embed_fp16_chunk(const void *table, const void *tokens, void *out,
+                                  int32_t hidden, int32_t rows, int32_t n);
+wst_status_t wst_embed_int4_g128_chunk(const void *qw, const void *sz, const void *tokens,
+                                       void *out, int32_t hidden, int32_t rows,
+                                       int32_t n);
+wst_status_t wst_embed_int4_hier_chunk(const void *qw, const void *si, const void *sb,
+                                       const void *tokens, void *out, int32_t hidden,
+                                       int32_t rows, int32_t n);
+
+/* Greedy choice for every row of [n][vocab], reduced on the device. */
+wst_status_t wst_argmax_chunk(const void *logits, void *out, int32_t vocab, int32_t n);
 
 #ifdef __cplusplus
 }

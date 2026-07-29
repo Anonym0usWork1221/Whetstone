@@ -133,6 +133,18 @@ enum Command {
         /// Force an int4 GEMV variant (see `whetstone bench`). -1 = baseline.
         #[arg(long)]
         gemv_variant: Option<i32>,
+        /// Speculative decoding: propose this many tokens per verification
+        /// pass with an n-gram draft. 0 disables. Output is identical to greedy
+        /// either way -- a draft token is accepted only when it equals the
+        /// model's own argmax -- so this is a pure throughput knob.
+        #[arg(long, default_value_t = 0)]
+        spec: usize,
+        /// VRAM budget for weights, e.g. "3GB" or "512MB". Whole transformer
+        /// blocks past the budget are left in host RAM and read over PCIe --
+        /// ~6 GB/s against the card's ~278, so this trades roughly 46x on every
+        /// offloaded byte. It is how a model larger than VRAM runs at all.
+        #[arg(long)]
+        vram: Option<String>,
     },
 
     /// Interactive chat, with throughput reported per turn.
@@ -178,6 +190,16 @@ enum Command {
         /// PRNG seed.
         #[arg(long, default_value_t = 0)]
         seed: u64,
+        /// VRAM budget for weights, e.g. "3GB". Whole transformer blocks past
+        /// the budget stay in host RAM and are read over PCIe at ~6 GB/s
+        /// against the card's ~278. That is how a model larger than VRAM runs
+        /// -- and why --spec matters far more once it is set.
+        #[arg(long)]
+        vram: Option<String>,
+        /// Speculative decoding: propose this many tokens per verification
+        /// pass. Output is identical to greedy. Needs --temperature 0.
+        #[arg(long, default_value_t = 0)]
+        spec: usize,
         /// Answer this once and exit, instead of reading from the terminal.
         #[arg(long)]
         prompt: Option<String>,
@@ -294,11 +316,15 @@ fn main() -> Result<()> {
             repeat_last_n,
             seed,
             prompt,
+            vram,
+            spec,
         } => chat::run(chat::ChatArgs {
             model: &model,
             tokenizer: tokenizer.as_deref(),
             system,
             ctx,
+            vram,
+            spec,
             max_new,
             temperature,
             top_p,
@@ -336,6 +362,8 @@ fn main() -> Result<()> {
             profile,
             graph,
             gemv_variant,
+            vram,
+            spec,
         } => {
             let parsed = parse_ids(&ids)?;
             run::run(run::RunArgs {
@@ -351,6 +379,8 @@ fn main() -> Result<()> {
                 profile,
                 graph,
                 gemv_variant,
+                vram,
+                spec,
             })
             .context("run failed")
         }

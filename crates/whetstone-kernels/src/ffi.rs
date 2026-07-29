@@ -143,6 +143,8 @@ extern "C" {
 
     pub(crate) fn wst_malloc(out_ptr: *mut *mut c_void, bytes: usize) -> i32;
     pub(crate) fn wst_free(ptr: *mut c_void) -> i32;
+    pub(crate) fn wst_malloc_host(out_ptr: *mut *mut c_void, bytes: usize) -> i32;
+    pub(crate) fn wst_host_alloc_supported() -> i32;
     pub(crate) fn wst_memset(dst: *mut c_void, value: i32, bytes: usize) -> i32;
     pub(crate) fn wst_memcpy_h2d(dst: *mut c_void, src: *const c_void, bytes: usize) -> i32;
     pub(crate) fn wst_memcpy_d2h(dst: *mut c_void, src: *const c_void, bytes: usize) -> i32;
@@ -305,6 +307,115 @@ extern "C" {
 
     pub(crate) fn wst_argmax(logits: *const c_void, out_idx: *mut c_void, n: i32) -> i32;
     pub(crate) fn wst_nll(logits: *const c_void, target: i32, acc: *mut c_void, n: i32) -> i32;
+
+    // ---- multi-token chunk path (cuda/chunk_gemm.cu, cuda/chunk_ops.cu) ----
+
+    pub(crate) fn wst_chunk_max_tokens() -> i32;
+
+    pub(crate) fn wst_gemm_int4_hier(
+        qw: *const c_void,
+        si: *const c_void,
+        sb: *const c_void,
+        x: *const c_void,
+        bias: *const c_void,
+        y: *mut c_void,
+        in_f: i32,
+        out_f: i32,
+        n: i32,
+        accum: i32,
+    ) -> i32;
+
+    pub(crate) fn wst_gemm_fp16(
+        w: *const c_void,
+        x: *const c_void,
+        bias: *const c_void,
+        y: *mut c_void,
+        in_f: i32,
+        out_f: i32,
+        n: i32,
+        accum: i32,
+    ) -> i32;
+
+    pub(crate) fn wst_rmsnorm_chunk(
+        x: *const c_void,
+        w: *const c_void,
+        out: *mut c_void,
+        dim: i32,
+        n: i32,
+        eps: f32,
+    ) -> i32;
+
+    pub(crate) fn wst_rope_cache_chunk(
+        qkv: *mut c_void,
+        k_cache: *mut c_void,
+        v_cache: *mut c_void,
+        cos_tab: *const c_void,
+        sin_tab: *const c_void,
+        n_q: i32,
+        n_kv: i32,
+        head_dim: i32,
+        pos0: i32,
+        n: i32,
+        max_seq: i32,
+    ) -> i32;
+
+    pub(crate) fn wst_attn_chunk(
+        qkv: *const c_void,
+        k_cache: *const c_void,
+        v_cache: *const c_void,
+        out: *mut c_void,
+        n_q: i32,
+        n_kv: i32,
+        head_dim: i32,
+        pos0: i32,
+        n: i32,
+        max_seq: i32,
+        scale: f32,
+    ) -> i32;
+
+    pub(crate) fn wst_swiglu_chunk(
+        gate_up: *const c_void,
+        out: *mut c_void,
+        inter: i32,
+        n: i32,
+    ) -> i32;
+
+    pub(crate) fn wst_embed_fp16_chunk(
+        table: *const c_void,
+        tokens: *const c_void,
+        out: *mut c_void,
+        hidden: i32,
+        rows: i32,
+        n: i32,
+    ) -> i32;
+
+    pub(crate) fn wst_embed_int4_g128_chunk(
+        qw: *const c_void,
+        sz: *const c_void,
+        tokens: *const c_void,
+        out: *mut c_void,
+        hidden: i32,
+        rows: i32,
+        n: i32,
+    ) -> i32;
+
+    pub(crate) fn wst_embed_int4_hier_chunk(
+        qw: *const c_void,
+        si: *const c_void,
+        sb: *const c_void,
+        tokens: *const c_void,
+        out: *mut c_void,
+        hidden: i32,
+        rows: i32,
+        n: i32,
+    ) -> i32;
+
+    pub(crate) fn wst_argmax_chunk(
+        logits: *const c_void,
+        out: *mut c_void,
+        vocab: i32,
+        n: i32,
+    ) -> i32;
 }
 
 #[cfg(test)]

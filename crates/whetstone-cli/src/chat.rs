@@ -85,6 +85,10 @@ pub struct ChatArgs<'a> {
     pub seed: u64,
     /// Answer this and exit, instead of reading from the terminal.
     pub prompt: Option<String>,
+    /// VRAM budget for weights. `None` keeps everything on the device.
+    pub vram: Option<String>,
+    /// Draft width for speculative decoding. `0` disables.
+    pub spec: usize,
 }
 
 impl ChatArgs<'_> {
@@ -123,9 +127,12 @@ fn describe(cfg: &SamplingConfig) -> String {
 }
 
 pub fn run(args: ChatArgs<'_>) -> Result<()> {
+    let budget = args.vram.as_deref().map(crate::run::parse_bytes).transpose()?;
+
     let t0 = Instant::now();
-    let weights = ModelWeights::load(args.model)
+    let weights = ModelWeights::load_with(args.model, budget)
         .with_context(|| format!("could not load {}", args.model.display()))?;
+    let residency = weights.residency;
 
     // Prefer the tokenizer the converter embedded: a `.wstone` is meant to be
     // self-contained, and requiring the original checkpoint alongside it would
@@ -174,6 +181,20 @@ pub fn run(args: ChatArgs<'_>) -> Result<()> {
         args.ctx,
         kv as f64 / 1e6
     );
+    if !residency.fully_resident() {
+        println!(
+            "  offload            {} of {} blocks in host RAM ({:.0} MB over PCIe/token)",
+            residency.host_layers,
+            residency.host_layers + residency.device_layers,
+            residency.host_bytes as f64 / 1e6
+        );
+    }
+    if args.spec > 1 {
+        println!(
+            "  speculation        draft {} per verification pass (output is greedy-exact)",
+            args.spec
+        );
+    }
     println!(
         "  vram               {:.0} MB weights + {:.0} MB cache of {:.1} GB",
         decode_bytes as f64 / 1e6,
@@ -202,7 +223,7 @@ pub fn run(args: ChatArgs<'_>) -> Result<()> {
     if let Some(p) = &args.prompt {
         let prompt = segment(&system, p, true);
         answer(&mut engine, &tokenizer, &prompt, sampler_of(&cfg), args.max_new, im_end, eos,
-               decode_bytes, ansi, &mut turn, &mut totals)?;
+               decode_bytes, ansi, &mut turn, &mut totals, args.spec)?;
         return Ok(());
     }
 
@@ -283,7 +304,7 @@ pub fn run(args: ChatArgs<'_>) -> Result<()> {
         // cache. The system prompt therefore appears exactly once.
         let prompt = segment(&system, msg, turn == 0);
         if let Err(e) = answer(&mut engine, &tokenizer, &prompt, sampler_of(&cfg), args.max_new,
-                               im_end, eos, decode_bytes, ansi, &mut turn, &mut totals) {
+                               im_end, eos, decode_bytes, ansi, &mut turn, &mut totals, args.spec) {
             println!("\n  error: {e}\n");
             if format!("{e}").contains("context is full") {
                 println!("  The KV cache is full. /reset to start over, or restart with a");
@@ -336,13 +357,14 @@ fn answer(
     ansi: bool,
     turn: &mut usize,
     totals: &mut (usize, f64),
+    spec: usize,
 ) -> Result<()> {
     let ids = tok.encode(prompt);
     let mut dec = StreamDecoder::default();
     let mut stdout = std::io::stdout();
 
     let t0 = Instant::now();
-    let stats = engine.generate(&ids, max_new, sampler, |id| {
+    let mut emit = |id: u32| -> bool {
         if id == im_end || Some(id) == eos {
             return false;
         }
@@ -352,7 +374,14 @@ fn answer(
             let _ = stdout.flush();
         }
         true
-    })?;
+    };
+    let (stats, spec_stats) = if spec > 1 && matches!(sampler, Sampler::Greedy) {
+        let cfg = whetstone_core::SpecConfig { draft: spec, ..Default::default() };
+        let (s, sp) = whetstone_core::speculate::generate(engine, &ids, max_new, cfg, &mut emit)?;
+        (s, Some(sp))
+    } else {
+        (engine.generate(&ids, max_new, sampler, &mut emit)?, None)
+    };
     let tail = dec.finish();
     if !tail.is_empty() {
         let _ = stdout.write_all(tail.as_bytes());
@@ -383,6 +412,9 @@ fn answer(
     // The wall clock includes tokenization and terminal writes; when it diverges
     // from the decode time the bottleneck is not the model, and saying so beats
     // letting someone tune kernels against a number the terminal set.
+    if let Some(sp) = spec_stats {
+        print!("{dim}  [spec {:.2} tok/pass, {:.0}% accepted]{off}", sp.tokens_per_round(), sp.acceptance() * 100.0);
+    }
     if wall > stats.decode_seconds * 1.25 {
         print!("{dim}  (wall {wall:.2} s - output, not the engine){off}");
     }
